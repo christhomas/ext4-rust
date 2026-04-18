@@ -1,329 +1,163 @@
 #!/bin/bash
-# Build a matrix of ext4 test images covering different feature combinations.
-# Each image gets a sibling .meta.txt describing its features + expected contents.
+# Build the ext4 test-disk fixtures inside a qemu-hosted Alpine Linux VM.
 #
-# Why Docker: macOS doesn't have mkfs.ext4. We use a tiny Linux container
-# (debian:bookworm-slim has e2fsprogs in ~50MB) to build the images.
+# Why qemu: mkfs.ext4, loop-mount, setfattr, setfacl — all Linux-only.
+# qemu works everywhere (macOS, Linux, in CI), so one script drives
+# the build on any host. Nothing about ext4rs itself touches platform
+# specifics; this is just a build-time convenience.
 #
-# Usage: bash build-ext4-feature-images.sh [name1 name2 ...]
-#        (no args = build all)
+# First run downloads Alpine's netboot kernel + initramfs + modloop
+# (~40 MB total) into .vm-cache/. Subsequent runs reuse the cache.
+#
+# Usage:
+#   bash build-ext4-feature-images.sh              # build all images
+#   bash build-ext4-feature-images.sh htree xattr  # build named ones
+#
+# Requires: qemu-system-x86_64, python3 (for the tiny apkovl HTTP
+# server), tar, curl. All available on macOS (brew install qemu),
+# ubuntu-latest (apt install qemu-system-x86), and alpine/fedora.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-if ! command -v docker >/dev/null; then
-    echo "ERROR: docker required (macOS lacks mkfs.ext4)" >&2
+CACHE="$SCRIPT_DIR/.vm-cache"
+mkdir -p "$CACHE"
+
+# ---------------------------------------------------------------------------
+# Step 1 — pin Alpine version + download netboot assets on first run.
+# ---------------------------------------------------------------------------
+ALPINE_VER=3.21.4
+ALPINE_REL="${ALPINE_VER%.*}"
+ALPINE_BASE="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/releases/x86_64/netboot-${ALPINE_VER}"
+
+download_if_missing() {
+    local url="$1" out="$2"
+    if [ ! -s "$out" ]; then
+        echo "[host] downloading $(basename "$out")..."
+        curl -fsSL -o "$out" "$url"
+    fi
+}
+download_if_missing "$ALPINE_BASE/vmlinuz-virt"   "$CACHE/vmlinuz-virt"
+download_if_missing "$ALPINE_BASE/initramfs-virt" "$CACHE/initramfs-virt"
+download_if_missing "$ALPINE_BASE/modloop-virt"   "$CACHE/modloop-virt"
+
+# ---------------------------------------------------------------------------
+# Step 2 — assemble the apkovl (Alpine overlay) that wires our guest
+# builder in as an auto-started local.d service.
+# ---------------------------------------------------------------------------
+OVL_TMP="$CACHE/ovl"
+rm -rf "$OVL_TMP"
+mkdir -p "$OVL_TMP/etc/local.d" "$OVL_TMP/etc/runlevels/default" "$OVL_TMP/etc/apk"
+
+# /etc/apk/world — packages Alpine's diskless setup will install
+# during boot (via `apk add` after applying the overlay). These are
+# everything we need to run the mkfs/mount/xattr/acl commands.
+cat > "$OVL_TMP/etc/apk/world" <<'PKGS_EOF'
+alpine-base
+busybox
+e2fsprogs
+e2fsprogs-extra
+attr
+acl
+util-linux
+PKGS_EOF
+
+# Use HTTP (not HTTPS) for the apk mirror — qemu NAT DNS works,
+# but TLS handshake against dl-cdn has been flaky in the boot
+# environment. APK packages are signed independently of TLS.
+cat > "$OVL_TMP/etc/apk/repositories" <<REPO_EOF
+http://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/main
+http://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/community
+REPO_EOF
+
+# qemu's built-in DNS at 10.0.2.3 works but the guest's resolver
+# doesn't always detect it; pin public resolvers explicitly.
+cat > "$OVL_TMP/etc/resolv.conf" <<'DNS_EOF'
+nameserver 10.0.2.3
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+DNS_EOF
+
+# Wrapper that chains the real builder (which lives on the 9p host
+# share, so we don't bake it into the apkovl). Writes a done-marker
+# back to the host so the watchdog knows the guest finished cleanly.
+cat > "$OVL_TMP/etc/local.d/99-ext4.start" <<'WRAPPER_EOF'
+#!/bin/sh
+set -eu
+echo "[vm] local.d starting"
+# modules we need for 9p
+modprobe 9p 9pnet 9pnet_virtio 2>/dev/null || true
+modprobe loop 2>/dev/null || true
+
+mkdir -p /host
+mount -t 9p -o trans=virtio,version=9p2000.L,msize=131072 host /host
+
+sh /host/_vm-builder.sh $(cat /host/.vm-cache/vm-args 2>/dev/null) \
+        > /host/.vm-cache/vm-build.log 2>&1 \
+    && touch /host/.vm-cache/vm-build.done \
+    || touch /host/.vm-cache/vm-build.failed
+
+sync
+poweroff -f
+WRAPPER_EOF
+chmod +x "$OVL_TMP/etc/local.d/99-ext4.start"
+
+# Enable the `local` service so OpenRC runs /etc/local.d/*.start at boot.
+ln -sf /etc/init.d/local "$OVL_TMP/etc/runlevels/default/local"
+
+# Apkovl must be a .tar.gz whose filename matches a hostname the
+# overlay applies to. Alpine init also accepts a generic filename
+# via the `apkovl=` boot option, which is what we use below.
+rm -f "$CACHE/ovl.apkovl.tar.gz" "$CACHE/vm-build.done" "$CACHE/vm-build.failed" "$CACHE/vm-build.log"
+(cd "$OVL_TMP" && tar -czf "$CACHE/ovl.apkovl.tar.gz" etc)
+
+# ---------------------------------------------------------------------------
+# Step 3 — serve the apkovl over a throwaway localhost HTTP server so
+# Alpine's init can fetch it via qemu's NAT gateway (10.0.2.2).
+# ---------------------------------------------------------------------------
+HTTP_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+python3 -m http.server "$HTTP_PORT" --directory "$CACHE" --bind 127.0.0.1 >/dev/null 2>&1 &
+HTTP_PID=$!
+sleep 0.3
+cleanup() {
+    kill "$HTTP_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Step 4 — boot Alpine under qemu with a 9p share of this directory.
+# ---------------------------------------------------------------------------
+echo "[host] booting Alpine under qemu (serial -> stdout)..."
+
+# Pass the requested image-name list through to the guest by storing
+# it on the 9p share — the local.d wrapper reads it back.
+printf '%s\n' "$@" > "$CACHE/vm-args"
+
+qemu-system-x86_64 \
+    -kernel "$CACHE/vmlinuz-virt" \
+    -initrd "$CACHE/initramfs-virt" \
+    -append "console=ttyS0 modules=loop,squashfs,sd-mod,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio ip=dhcp apkovl=http://10.0.2.2:${HTTP_PORT}/ovl.apkovl.tar.gz alpine_repo=http://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/main modloop=http://10.0.2.2:${HTTP_PORT}/modloop-virt" \
+    -virtfs local,path="$SCRIPT_DIR",mount_tag=host,security_model=mapped-xattr,id=host \
+    -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+    -m 1024 \
+    -smp 2 \
+    -nographic \
+    -no-reboot
+
+# ---------------------------------------------------------------------------
+# Step 5 — inspect the done-marker the guest left behind.
+# ---------------------------------------------------------------------------
+if [ -f "$CACHE/vm-build.done" ]; then
+    echo "[host] guest reported success."
+    exit 0
+elif [ -f "$CACHE/vm-build.failed" ]; then
+    echo "[host] guest reported failure. Last 50 lines of vm-build.log:" >&2
+    tail -n 50 "$CACHE/vm-build.log" >&2 || true
+    exit 1
+else
+    echo "[host] guest exited without writing a done marker — something" >&2
+    echo "       went wrong during boot. Check earlier serial output." >&2
     exit 1
 fi
-
-IMAGE=debian:bookworm-slim
-
-# Helper: run a shell snippet inside the container with /work mounted to here.
-# --privileged needed for `mount -o loop` inside the container.
-in_container() {
-    docker run --rm --platform=linux/amd64 --privileged \
-        -v "$SCRIPT_DIR:/work" -w /work \
-        "$IMAGE" bash -c "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq e2fsprogs attr acl >/dev/null 2>&1 && $1"
-}
-
-build_htree() {
-    local img=ext4-htree.img
-    local meta=ext4-htree.meta.txt
-    echo "==> $img — directory with many entries forcing htree indexing"
-    in_container "
-        rm -f $img
-        truncate -s 16M $img
-        mkfs.ext4 -q -F -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,uninit_bg,metadata_csum -L htree-vol $img
-        mkdir -p /mnt/img && mount -o loop $img /mnt/img
-        # Create 256 files in /bigdir to force htree indexing
-        mkdir -p /mnt/img/bigdir
-        for i in \$(seq 1 256); do
-            printf 'content of file %03d\n' \$i > /mnt/img/bigdir/file_\$i.txt
-        done
-        echo 'small file content' > /mnt/img/small.txt
-        sync
-        umount /mnt/img
-        chown $(id -u):$(id -g) $img
-    "
-    cat > "$meta" <<EOF
-image: $img
-features: has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,uninit_bg,metadata_csum
-volume_label: htree-vol
-contents:
-  /small.txt — "small file content\n" (19 bytes)
-  /bigdir/   — 256 files (file_001.txt .. file_256.txt), forces htree indexing
-test_targets:
-  - lookup any /bigdir/file_NNN.txt via htree path
-  - readdir of /bigdir returns 258 entries (256 + . + ..)
-EOF
-}
-
-build_csum_seed() {
-    local img=ext4-csum-seed.img
-    local meta=ext4-csum-seed.meta.txt
-    echo "==> $img — Pi SD card style with INCOMPAT_CSUM_SEED"
-    in_container "
-        rm -f $img
-        truncate -s 16M $img
-        # csum_seed requires metadata_csum
-        mkfs.ext4 -q -F -O has_journal,extent,64bit,flex_bg,metadata_csum,metadata_csum_seed -L csum-seed-vol $img
-        mkdir -p /mnt/img && mount -o loop $img /mnt/img
-        echo 'pi-style file' > /mnt/img/hello.txt
-        mkdir -p /mnt/img/etc
-        echo 'fake fstab' > /mnt/img/etc/fstab
-        sync
-        umount /mnt/img
-        chown $(id -u):$(id -g) $img
-    "
-    cat > "$meta" <<EOF
-image: $img
-features: has_journal,extent,64bit,flex_bg,metadata_csum,metadata_csum_seed
-volume_label: csum-seed-vol
-contents:
-  /hello.txt   — "pi-style file\n" (14 bytes)
-  /etc/fstab   — "fake fstab\n" (11 bytes)
-notes:
-  INCOMPAT_CSUM_SEED stores the checksum seed in superblock instead of
-  deriving from UUID. Same flag that broke lwext4 on the Pi SD card.
-EOF
-}
-
-build_no_csum() {
-    local img=ext4-no-csum.img
-    local meta=ext4-no-csum.meta.txt
-    echo "==> $img — legacy ext4 without metadata_csum"
-    in_container "
-        rm -f $img
-        truncate -s 8M $img
-        mkfs.ext4 -q -F -O ^metadata_csum,extent,64bit,filetype,dir_index,sparse_super -L no-csum-vol $img
-        mkdir -p /mnt/img && mount -o loop $img /mnt/img
-        echo 'no checksum here' > /mnt/img/file.txt
-        sync
-        umount /mnt/img
-        chown $(id -u):$(id -g) $img
-    "
-    cat > "$meta" <<EOF
-image: $img
-features: extent,64bit,filetype,dir_index,sparse_super (NO metadata_csum)
-volume_label: no-csum-vol
-contents:
-  /file.txt — "no checksum here\n" (17 bytes)
-notes:
-  Tests that we don't accidentally require checksums when the FS lacks them.
-EOF
-}
-
-build_deep_extents() {
-    local img=ext4-deep-extents.img
-    local meta=ext4-deep-extents.meta.txt
-    echo "==> $img — file with multi-level extent tree (sparse + fragmented)"
-    in_container "
-        rm -f $img
-        truncate -s 64M $img
-        mkfs.ext4 -q -F -O extent,64bit,flex_bg,metadata_csum -L deep-vol $img
-        mkdir -p /mnt/img && mount -o loop $img /mnt/img
-        # Create a sparse file with many holes to force extent tree depth.
-        # Write 1 byte at offsets 0, 64K, 128K, ... 16M = ~256 extents,
-        # which should overflow the 4-extent inline limit and require leaf blocks.
-        dd if=/dev/zero of=/mnt/img/sparse.bin bs=1 count=0 seek=16M status=none
-        for off in \$(seq 0 65536 16000000); do
-            printf 'X' | dd of=/mnt/img/sparse.bin bs=1 count=1 seek=\$off conv=notrunc status=none
-        done
-        # Also a small dense file as control
-        echo 'control file' > /mnt/img/dense.txt
-        sync
-        umount /mnt/img
-        chown $(id -u):$(id -g) $img
-    "
-    cat > "$meta" <<EOF
-image: $img
-features: extent,64bit,flex_bg,metadata_csum
-volume_label: deep-vol
-contents:
-  /sparse.bin  — 16 MB sparse file with single 'X' bytes every 64 KB
-                 (~245 extents — forces multi-level extent tree)
-  /dense.txt   — "control file\n" (13 bytes, single inline extent)
-test_targets:
-  - extent::lookup must descend through internal nodes for high logical blocks
-  - sparse holes should read as zero
-EOF
-}
-
-build_inline() {
-    local img=ext4-inline.img
-    local meta=ext4-inline.meta.txt
-    echo "==> $img — files using INCOMPAT_INLINE_DATA (data lives in inode)"
-    in_container "
-        rm -f $img
-        truncate -s 8M $img
-        # inline_data must be set at mkfs time
-        mkfs.ext4 -q -F -O ext_attr,extent,64bit,filetype,dir_index,metadata_csum,inline_data -L inline-vol -I 256 $img
-        mkdir -p /mnt/img && mount -o loop $img /mnt/img
-        # Tiny file (≤60 bytes) — fits in i_block alone
-        echo 'tiny inline' > /mnt/img/tiny.txt
-        # Medium file (60–~150 bytes) — overflows into system.data xattr
-        printf 'A%.0s' \$(seq 1 100) > /mnt/img/medium.txt
-        # Symlink (always inline if ≤60 bytes)
-        ln -s 'target/path/here' /mnt/img/symlink
-        sync
-        umount /mnt/img
-        chown $(id -u):$(id -g) $img
-    "
-    cat > "$meta" <<EOF
-image: $img
-features: ext_attr,extent,64bit,filetype,dir_index,metadata_csum,inline_data
-volume_label: inline-vol
-contents:
-  /tiny.txt    — "tiny inline\n" (12 bytes, in i_block only)
-  /medium.txt  — 100x 'A' (100 bytes, overflows to system.data xattr)
-  /symlink     — symlink to "target/path/here"
-test_targets:
-  - read /tiny.txt returns full 12 bytes
-  - read /medium.txt returns full 100 bytes (i_block + xattr concat)
-  - readlink /symlink returns "target/path/here"
-EOF
-}
-
-build_xattr() {
-    local img=ext4-xattr.img
-    local meta=ext4-xattr.meta.txt
-    echo "==> $img — files with extended attributes (Finder-style metadata)"
-    in_container "
-        rm -f $img
-        truncate -s 8M $img
-        mkfs.ext4 -q -F -O ext_attr,extent,64bit,filetype,dir_index,metadata_csum,inline_data -L xattr-vol $img
-        mkdir -p /mnt/img && mount -o loop $img /mnt/img
-        echo 'has xattrs' > /mnt/img/tagged.txt
-        # Set a few xattrs covering different namespaces
-        setfattr -n user.color -v 'red' /mnt/img/tagged.txt
-        setfattr -n user.com.apple.FinderInfo -v '0xDEADBEEF' /mnt/img/tagged.txt
-        # Also a directory with xattrs
-        mkdir /mnt/img/tagged_dir
-        setfattr -n user.purpose -v 'documents' /mnt/img/tagged_dir
-        # And a plain file with no xattrs as a control
-        echo 'no xattrs here' > /mnt/img/plain.txt
-        sync
-        umount /mnt/img
-        chown $(id -u):$(id -g) $img
-    "
-    cat > "$meta" <<EOF
-image: $img
-features: ext_attr,extent,64bit,filetype,dir_index,metadata_csum,inline_data
-volume_label: xattr-vol
-contents:
-  /tagged.txt    — "has xattrs\n"; xattrs: user.color=red, user.com.apple.FinderInfo=0xDEADBEEF
-  /tagged_dir/   — directory; xattrs: user.purpose=documents
-  /plain.txt     — "no xattrs here\n"; no xattrs
-test_targets:
-  - read user.color, user.com.apple.FinderInfo on /tagged.txt
-  - read user.purpose on /tagged_dir
-  - /plain.txt has empty xattr list
-EOF
-}
-
-build_acl() {
-    local img=ext4-acl.img
-    local meta=ext4-acl.meta.txt
-    echo "==> $img — files + dirs with POSIX ACL xattrs"
-    in_container "
-        set -e
-        rm -f $img
-        truncate -s 8M $img
-        mkfs.ext4 -q -F -O ext_attr,extent,64bit,filetype,dir_index,metadata_csum -L acl-vol $img
-        tune2fs -o acl,user_xattr $img
-        mkdir -p /mnt/img && mount -o loop,acl,user_xattr $img /mnt/img
-        echo 'minimal acl' > /mnt/img/mode_only.txt
-        setfacl -m u::rwx,g::r-x,o::r-- /mnt/img/mode_only.txt
-        echo 'named entries' > /mnt/img/named.txt
-        setfacl -m u:1000:rw-,g:2000:r--,m::rwx /mnt/img/named.txt
-        mkdir /mnt/img/acl_dir
-        setfacl -m u::rwx,g::r-x,o::--x,d:u::rwx,d:g::r-x,d:o::--- /mnt/img/acl_dir
-        echo 'no acl' > /mnt/img/plain.txt
-        sync
-        echo '--- verify ACL xattrs via getfattr (in container) ---'
-        getfattr -m '^system.posix_acl' -d /mnt/img/named.txt /mnt/img/acl_dir || true
-        umount /mnt/img
-        chown $(id -u):$(id -g) $img
-    "
-    cat > "$meta" <<EOF
-image: $img
-features: ext_attr,extent,64bit,filetype,dir_index,metadata_csum
-volume_label: acl-vol
-contents:
-  /mode_only.txt  — access ACL: u::rwx, g::r-x, o::r--
-  /named.txt      — access ACL: u::rwx, u:1000:rw-, g::r-x, g:2000:r--, m::rwx, o::r--
-  /acl_dir/       — access + default ACL (u::rwx g::r-x o::--x; d:u::rwx d:g::r-x d:o::---)
-  /plain.txt      — no ACL
-test_targets:
-  - system.posix_acl_access on /mode_only.txt decodes to 3 short entries
-  - system.posix_acl_access on /named.txt has User(1000) + Group(2000) entries
-  - /acl_dir has both system.posix_acl_access and system.posix_acl_default
-  - /plain.txt has neither acl xattr
-EOF
-}
-
-build_largedir() {
-    local img=ext4-largedir.img
-    local meta=ext4-largedir.meta.txt
-    echo "==> $img — huge directory forcing deep htree (LARGEDIR ro_compat)"
-    in_container "
-        set -e
-        rm -f $img
-        # 192M gives enough room for 70k inodes (default 16K ratio => ~12k
-        # inodes otherwise). -N overrides the inode count directly.
-        truncate -s 192M $img
-        mkfs.ext4 -q -F -N 80000 \
-            -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,uninit_bg,metadata_csum,large_dir \
-            -L largedir-vol $img
-        mkdir -p /mnt/img && mount -o loop $img /mnt/img
-        mkdir -p /mnt/img/huge
-        # Zero-length files via touch — dir entries are what we care about.
-        # 70000 entries comfortably forces an htree >= 2 leaf levels with
-        # LARGEDIR enabled (kernel lifts the 2-level cap when ro_compat
-        # LARGEDIR is set).
-        seq -w 1 70000 | while read -r i; do
-            : > /mnt/img/huge/file_\$i.txt
-        done
-        echo 'control' > /mnt/img/small.txt
-        sync
-        umount /mnt/img
-        chown $(id -u):$(id -g) $img
-    "
-    cat > "$meta" <<EOF
-image: $img
-features: has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,uninit_bg,metadata_csum,large_dir
-volume_label: largedir-vol
-contents:
-  /small.txt — "control\n" (8 bytes)
-  /huge/     — 70000 zero-length files (file_00001.txt .. file_70000.txt)
-               forces htree past its legacy 2-level cap (LARGEDIR ro_compat).
-test_targets:
-  - htree::lookup_leaf descends > 1 internal level to resolve /huge/file_NNNNN
-  - readdir of /huge returns 70002 entries (70000 + . + ..)
-  - random-sample stat on file_00001 / file_35000 / file_70000 all succeed
-EOF
-}
-
-# Default: build all
-ALL=(htree csum_seed no_csum deep_extents xattr inline acl largedir)
-TARGETS=("${@:-${ALL[@]}}")
-
-for t in "${TARGETS[@]}"; do
-    case "$t" in
-        htree)        build_htree ;;
-        csum_seed)    build_csum_seed ;;
-        no_csum)      build_no_csum ;;
-        deep_extents) build_deep_extents ;;
-        xattr)        build_xattr ;;
-        inline)       build_inline ;;
-        acl)          build_acl ;;
-        largedir)     build_largedir ;;
-        *)            echo "Unknown target: $t (have: ${ALL[*]})" >&2; exit 1 ;;
-    esac
-done
-
-echo ""
-echo "Done. Generated images:"
-ls -lh ext4-*.img 2>/dev/null
