@@ -27,6 +27,10 @@ build_basic() {
     mount -t ext4 -o loop $img /mnt/img
     printf 'hello from ext4\n' > /mnt/img/test.txt
     mkdir -p /mnt/img/subdir
+    # /subdir needs at least one entry so rmdir-on-nonempty-dir
+    # tests actually hit ENOTEMPTY. Without this, /subdir has only
+    # `.` and `..` and the rmdir would succeed.
+    echo 'nested' > /mnt/img/subdir/nested.txt
     ln -s test.txt /mnt/img/link.txt
     sync
     umount /mnt/img
