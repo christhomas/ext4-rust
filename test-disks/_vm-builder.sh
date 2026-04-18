@@ -1,20 +1,19 @@
 #!/bin/sh
-# GUEST-side: runs inside the qemu Alpine VM. Installs e2fsprogs,
-# mounts the host share, and builds every ext4 feature fixture
-# by running mkfs.ext4 + loop-mount + file-populate for each one.
+# GUEST-side: runs inside the qemu Alpine VM. Expects the caller
+# (local.d wrapper) to have already: mounted /host via 9p, and
+# extracted attr + acl .apk contents in-place. All of e2fsprogs,
+# busybox mount/dd/truncate, setfattr/setfacl are therefore on PATH.
 #
-# The host share is 9p-mounted at /host and contains the full
-# test-disks/ directory. Images are written back to /host so they
-# land directly on the host filesystem.
+# Each build_* function produces ONE ext4-*.img in /host so it lands
+# directly on the host filesystem. The mkfs/mount/setfattr/setfacl
+# commands are verbatim-compatible with the Linux pipeline that
+# previously ran under docker — test expectations baked into the
+# capi_* test suite depend on the exact content written here.
 
 set -eu
-
-echo "[vm] installing e2fsprogs + attr + acl..."
-apk add --no-cache e2fsprogs attr acl >/dev/null
-
-mkdir -p /host
-mount -t 9p -o trans=virtio,version=9p2000.L,msize=131072 host /host
 cd /host
+
+mkdir -p /mnt/img
 
 # --- image builders -------------------------------------------------------
 
@@ -23,8 +22,9 @@ build_basic() {
     echo "[vm] $img"
     rm -f $img
     truncate -s 16M $img
-    mkfs.ext4 -q -F -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum -L testvolume $img
-    mkdir -p /mnt/img && mount -o loop $img /mnt/img
+    mkfs.ext4 -q -F -b 4096 -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum \
+        -L testvolume $img
+    mount -t ext4 -o loop $img /mnt/img
     printf 'hello from ext4\n' > /mnt/img/test.txt
     mkdir -p /mnt/img/subdir
     ln -s test.txt /mnt/img/link.txt
@@ -37,8 +37,9 @@ build_htree() {
     echo "[vm] $img"
     rm -f $img
     truncate -s 16M $img
-    mkfs.ext4 -q -F -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum -L htree-vol $img
-    mount -o loop $img /mnt/img
+    mkfs.ext4 -q -F -b 4096 -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,uninit_bg,metadata_csum \
+        -L htree-vol $img
+    mount -t ext4 -o loop $img /mnt/img
     mkdir -p /mnt/img/bigdir
     i=1
     while [ $i -le 256 ]; do
@@ -55,8 +56,9 @@ build_csum_seed() {
     echo "[vm] $img"
     rm -f $img
     truncate -s 16M $img
-    mkfs.ext4 -q -F -O has_journal,extent,64bit,flex_bg,metadata_csum,metadata_csum_seed -L csum-seed-vol $img
-    mount -o loop $img /mnt/img
+    mkfs.ext4 -q -F -b 4096 -O has_journal,extent,64bit,flex_bg,metadata_csum,metadata_csum_seed \
+        -L csum-seed-vol $img
+    mount -t ext4 -o loop $img /mnt/img
     echo 'pi-style file' > /mnt/img/hello.txt
     mkdir -p /mnt/img/etc
     echo 'fake fstab' > /mnt/img/etc/fstab
@@ -68,10 +70,11 @@ build_no_csum() {
     local img=ext4-no-csum.img
     echo "[vm] $img"
     rm -f $img
-    truncate -s 16M $img
-    mkfs.ext4 -q -F -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super -L no-csum-vol $img
-    mount -o loop $img /mnt/img
-    echo 'plain file' > /mnt/img/hello.txt
+    truncate -s 8M $img
+    mkfs.ext4 -q -F -b 4096 -O ^metadata_csum,extent,64bit,filetype,dir_index,sparse_super \
+        -L no-csum-vol $img
+    mount -t ext4 -o loop $img /mnt/img
+    echo 'no checksum here' > /mnt/img/file.txt
     sync
     umount /mnt/img
 }
@@ -80,13 +83,18 @@ build_deep_extents() {
     local img=ext4-deep-extents.img
     echo "[vm] $img"
     rm -f $img
-    # Needs to be large enough to hold a file with many non-contiguous extents.
     truncate -s 64M $img
-    mkfs.ext4 -q -F -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum -L deep-vol $img
-    mount -o loop $img /mnt/img
-    # Produce a fragmented file by writing lots of small 4K-aligned
-    # holes interleaved with data.
-    dd if=/dev/urandom of=/mnt/img/fragmented.bin bs=4K count=5000 status=none
+    mkfs.ext4 -q -F -b 4096 -O extent,64bit,flex_bg,metadata_csum -L deep-vol $img
+    mount -t ext4 -o loop $img /mnt/img
+    # Sparse file with 1-byte 'X' writes every 64 KB up to 16 MB —
+    # ~245 extents force multi-level extent tree.
+    dd if=/dev/zero of=/mnt/img/sparse.bin bs=1 count=0 seek=16M status=none
+    off=0
+    while [ $off -lt 16000000 ]; do
+        printf 'X' | dd of=/mnt/img/sparse.bin bs=1 count=1 seek=$off conv=notrunc status=none
+        off=$((off + 65536))
+    done
+    echo 'control file' > /mnt/img/dense.txt
     sync
     umount /mnt/img
 }
@@ -95,11 +103,13 @@ build_inline() {
     local img=ext4-inline.img
     echo "[vm] $img"
     rm -f $img
-    truncate -s 16M $img
-    mkfs.ext4 -q -F -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum,inline_data -L inline-vol $img
-    mount -o loop $img /mnt/img
-    printf 'tiny' > /mnt/img/tiny.txt
-    mkdir -p /mnt/img/inline_dir
+    truncate -s 8M $img
+    mkfs.ext4 -q -F -b 4096 -I 256 -O ext_attr,extent,64bit,filetype,dir_index,metadata_csum,inline_data \
+        -L inline-vol $img
+    mount -t ext4 -o loop $img /mnt/img
+    echo 'tiny inline' > /mnt/img/tiny.txt
+    printf 'A%.0s' $(seq 1 100) > /mnt/img/medium.txt
+    ln -s 'target/path/here' /mnt/img/symlink
     sync
     umount /mnt/img
 }
@@ -108,12 +118,16 @@ build_xattr() {
     local img=ext4-xattr.img
     echo "[vm] $img"
     rm -f $img
-    truncate -s 16M $img
-    mkfs.ext4 -q -F -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum -L xattr-vol $img
-    mount -o loop,user_xattr $img /mnt/img
-    echo 'has xattrs' > /mnt/img/file.txt
-    setfattr -n user.comment -v 'hello-xattr' /mnt/img/file.txt
-    setfattr -n user.mood -v 'cheery' /mnt/img/file.txt
+    truncate -s 8M $img
+    mkfs.ext4 -q -F -b 4096 -O ext_attr,extent,64bit,filetype,dir_index,metadata_csum,inline_data \
+        -L xattr-vol $img
+    mount -t ext4 -o loop $img /mnt/img
+    echo 'has xattrs' > /mnt/img/tagged.txt
+    setfattr -n user.color -v 'red' /mnt/img/tagged.txt
+    setfattr -n user.com.apple.FinderInfo -v '0xDEADBEEF' /mnt/img/tagged.txt
+    mkdir /mnt/img/tagged_dir
+    setfattr -n user.purpose -v 'documents' /mnt/img/tagged_dir
+    echo 'no xattrs here' > /mnt/img/plain.txt
     sync
     umount /mnt/img
 }
@@ -122,12 +136,17 @@ build_acl() {
     local img=ext4-acl.img
     echo "[vm] $img"
     rm -f $img
-    truncate -s 16M $img
-    mkfs.ext4 -q -F -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum -L acl-vol $img
-    mount -o loop,acl $img /mnt/img
-    echo 'has ACLs' > /mnt/img/file.txt
-    setfacl -m u:1001:rwx /mnt/img/file.txt
-    setfacl -m g:500:rx /mnt/img/file.txt
+    truncate -s 8M $img
+    mkfs.ext4 -q -F -b 4096 -O ext_attr,extent,64bit,filetype,dir_index,metadata_csum -L acl-vol $img
+    tune2fs -o acl,user_xattr $img >/dev/null
+    mount -t ext4 -o loop,acl,user_xattr $img /mnt/img
+    echo 'minimal acl' > /mnt/img/mode_only.txt
+    setfacl -m u::rwx,g::r-x,o::r-- /mnt/img/mode_only.txt
+    echo 'named entries' > /mnt/img/named.txt
+    setfacl -m u:1000:rw-,g:2000:r--,m::rwx /mnt/img/named.txt
+    mkdir /mnt/img/acl_dir
+    setfacl -m u::rwx,g::r-x,o::--x,d:u::rwx,d:g::r-x,d:o::--- /mnt/img/acl_dir
+    echo 'no acl' > /mnt/img/plain.txt
     sync
     umount /mnt/img
 }
@@ -136,18 +155,16 @@ build_largedir() {
     local img=ext4-largedir.img
     echo "[vm] $img"
     rm -f $img
-    # largedir feature allows directories > 2GB; a modest 32M image
-    # is enough to exercise the on-disk htree depth bump the driver
-    # cares about.
-    truncate -s 32M $img
-    mkfs.ext4 -q -F -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum,large_dir -L largedir-vol $img
-    mount -o loop $img /mnt/img
-    mkdir -p /mnt/img/hugedir
-    i=1
-    while [ $i -le 4096 ]; do
-        : > /mnt/img/hugedir/file_$i.txt
-        i=$((i + 1))
+    truncate -s 192M $img
+    mkfs.ext4 -q -F -b 4096 -N 80000 \
+        -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,uninit_bg,metadata_csum,large_dir \
+        -L largedir-vol $img
+    mount -t ext4 -o loop $img /mnt/img
+    mkdir -p /mnt/img/huge
+    seq -w 1 70000 | while read -r i; do
+        : > /mnt/img/huge/file_$i.txt
     done
+    echo 'control' > /mnt/img/small.txt
     sync
     umount /mnt/img
 }
@@ -157,8 +174,9 @@ build_manyfiles() {
     echo "[vm] $img"
     rm -f $img
     truncate -s 16M $img
-    mkfs.ext4 -q -F -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum -L many-vol $img
-    mount -o loop $img /mnt/img
+    mkfs.ext4 -q -F -b 4096 -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum \
+        -L many-vol $img
+    mount -t ext4 -o loop $img /mnt/img
     i=1
     while [ $i -le 512 ]; do
         printf 'f%04d\n' $i > /mnt/img/file_$i.txt
@@ -168,25 +186,26 @@ build_manyfiles() {
     umount /mnt/img
 }
 
-mkdir -p /mnt/img
+# --- dispatch -------------------------------------------------------------
 
-if [ $# -eq 0 ]; then
-    build_basic
-    build_htree
-    build_csum_seed
-    build_no_csum
-    build_deep_extents
-    build_inline
-    build_xattr
-    build_acl
-    build_largedir
-    build_manyfiles
-else
-    for name in "$@"; do
-        "build_$name"
-    done
-fi
+ALL="basic htree csum_seed no_csum deep_extents inline xattr acl largedir manyfiles"
+TARGETS="${*:-$ALL}"
 
-echo "[vm] done — syncing + powering off."
+for t in $TARGETS; do
+    case "$t" in
+        basic)        build_basic ;;
+        htree)        build_htree ;;
+        csum_seed)    build_csum_seed ;;
+        no_csum)      build_no_csum ;;
+        deep_extents) build_deep_extents ;;
+        inline)       build_inline ;;
+        xattr)        build_xattr ;;
+        acl)          build_acl ;;
+        largedir)     build_largedir ;;
+        manyfiles)    build_manyfiles ;;
+        *)            echo "[vm] unknown target: $t (have: $ALL)" >&2; exit 1 ;;
+    esac
+done
+
+echo "[vm] done — syncing."
 sync
-poweroff -f

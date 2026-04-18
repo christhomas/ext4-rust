@@ -38,7 +38,9 @@ ALPINE_MAIN="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/main/x86_64"
 # embedded apk cache; downloaded separately and installed via
 # `apk add --allow-untrusted` from the 9p share after boot).
 ATTR_APK="attr-2.5.2-r2.apk"
+LIBATTR_APK="libattr-2.5.2-r2.apk"
 ACL_APK="acl-2.3.2-r1.apk"
+ACL_LIBS_APK="acl-libs-2.3.2-r1.apk"
 
 download_if_missing() {
     local url="$1" out="$2"
@@ -47,13 +49,26 @@ download_if_missing() {
         curl -fsSL -o "$out" "$url"
     fi
 }
-download_if_missing "$ALPINE_NETBOOT/vmlinuz-virt"   "$CACHE/vmlinuz-virt"
-download_if_missing "$ALPINE_NETBOOT/initramfs-virt" "$CACHE/initramfs-virt"
-download_if_missing "$ALPINE_ISO"                    "$CACHE/alpine-virt.iso"
+download_if_missing "$ALPINE_ISO" "$CACHE/alpine-virt.iso"
+
+# Extract the ISO's kernel + initramfs. The netboot ones differ —
+# the ISO's initramfs is configured to expect a local apk cache on
+# the boot CDROM and mounts it at /media/cdrom. The netboot one
+# expects to fetch packages from alpine_repo= at install time,
+# which doesn't suit our offline approach.
+if [ ! -s "$CACHE/vmlinuz-virt" ] || [ ! -s "$CACHE/initramfs-virt" ]; then
+    echo "[host] extracting kernel + initramfs from alpine-virt ISO..."
+    bsdtar -xf "$CACHE/alpine-virt.iso" -C "$CACHE" \
+        boot/vmlinuz-virt boot/initramfs-virt
+    cp "$CACHE/boot/vmlinuz-virt"   "$CACHE/vmlinuz-virt"
+    cp "$CACHE/boot/initramfs-virt" "$CACHE/initramfs-virt"
+fi
 
 mkdir -p "$CACHE/extra-apks"
-download_if_missing "$ALPINE_MAIN/$ATTR_APK" "$CACHE/extra-apks/$ATTR_APK"
-download_if_missing "$ALPINE_MAIN/$ACL_APK"  "$CACHE/extra-apks/$ACL_APK"
+download_if_missing "$ALPINE_MAIN/$ATTR_APK"     "$CACHE/extra-apks/$ATTR_APK"
+download_if_missing "$ALPINE_MAIN/$LIBATTR_APK"  "$CACHE/extra-apks/$LIBATTR_APK"
+download_if_missing "$ALPINE_MAIN/$ACL_APK"      "$CACHE/extra-apks/$ACL_APK"
+download_if_missing "$ALPINE_MAIN/$ACL_LIBS_APK" "$CACHE/extra-apks/$ACL_LIBS_APK"
 
 # ---------------------------------------------------------------------------
 # Step 2 — assemble the apkovl (Alpine overlay) that wires our guest
@@ -61,7 +76,26 @@ download_if_missing "$ALPINE_MAIN/$ACL_APK"  "$CACHE/extra-apks/$ACL_APK"
 # ---------------------------------------------------------------------------
 OVL_TMP="$CACHE/ovl"
 rm -rf "$OVL_TMP"
-mkdir -p "$OVL_TMP/etc/local.d" "$OVL_TMP/etc/runlevels/default" "$OVL_TMP/etc/apk"
+# sysinit runlevel: load modules + modloop so 9p-virtio gets
+# initialised before local.d runs. boot runlevel: minimal basics.
+# default runlevel: our ext4 builder (via local service).
+mkdir -p \
+    "$OVL_TMP/etc/local.d" \
+    "$OVL_TMP/etc/runlevels/sysinit" \
+    "$OVL_TMP/etc/runlevels/boot" \
+    "$OVL_TMP/etc/runlevels/default" \
+    "$OVL_TMP/etc/apk"
+
+# Standard Alpine sysinit+boot services that the LIVE ISO enables by
+# default but that the "install to new root" diskless flow doesn't
+# set up on its own. modloop is the critical one — without it
+# 9p-virtio module never loads and we can't reach the host share.
+for svc in devfs dmesg mdev hwdrivers modloop; do
+    ln -sf /etc/init.d/"$svc" "$OVL_TMP/etc/runlevels/sysinit/$svc"
+done
+for svc in bootmisc hostname hwclock modules sysctl syslog urandom; do
+    ln -sf /etc/init.d/"$svc" "$OVL_TMP/etc/runlevels/boot/$svc"
+done
 
 # /etc/apk/world — packages Alpine's diskless-init will install to
 # the new root before pivot. All available from the CDROM-backed
@@ -74,7 +108,6 @@ alpine-base
 busybox
 e2fsprogs
 e2fsprogs-extra
-util-linux
 PKGS_EOF
 
 # Single repo: the CDROM's local apk cache. Fully offline —
@@ -88,26 +121,45 @@ REPO_EOF
 # back to the host so the watchdog knows the guest finished cleanly.
 cat > "$OVL_TMP/etc/local.d/99-ext4.start" <<'WRAPPER_EOF'
 #!/bin/sh
-set -eu
-echo "[vm] local.d starting"
-# Ensure 9p + loop modules are loaded (the virt kernel has most
-# built-in but modprobe is idempotent so it's safe either way).
-modprobe 9p 9pnet 9pnet_virtio 2>/dev/null || true
-modprobe loop 2>/dev/null || true
+# Mirror everything to the console so a boot log captures it — the
+# vm-build.log on the 9p share is only available after the mount
+# succeeds, and debugging a silent failure is painful.
+exec > /dev/console 2>&1
+
+echo "=== [vm] local.d starting ==="
+
+# Modules are baked into the virt kernel (9p, 9pnet, 9pnet_virtio,
+# loop) so modprobe is mostly decorative, but harmless if missing.
+modprobe 9p 9pnet 9pnet_virtio loop 2>/dev/null || true
 
 mkdir -p /host
-mount -t 9p -o trans=virtio,version=9p2000.L,msize=131072 host /host
+if ! mount -t 9p -o trans=virtio,version=9p2000.L,msize=131072 host /host; then
+    echo "=== [vm] 9p mount failed — aborting ==="
+    poweroff -f
+fi
+echo "=== [vm] /host mounted ==="
 
-# Install the packages that weren't in the virt ISO's apk cache
-# (attr, acl) directly from the .apk files the host dropped on the
-# 9p share. --allow-untrusted because they aren't signed by a key
-# the VM's apk trusts (we downloaded them raw).
-apk add --no-network --allow-untrusted /host/.vm-cache/extra-apks/*.apk
+# .apk files are tar.gz archives of filesystem paths (plus a few
+# `.PKGINFO` / `.SIGN.*` metadata entries at the top). For a
+# one-shot VM, we don't need apk's package-db bookkeeping — just
+# extract the relevant binaries + shared libs in-place.
+for pkg in /host/.vm-cache/extra-apks/*.apk; do
+    echo "=== [vm] extracting $(basename "$pkg") ==="
+    tar -xzf "$pkg" -C / --exclude=.PKGINFO --exclude=.SIGN.\* \
+        --exclude=.pre-install --exclude=.post-install \
+        --exclude=.pre-upgrade --exclude=.post-upgrade 2>/dev/null || true
+done
 
-sh /host/_vm-builder.sh $(cat /host/.vm-cache/vm-args 2>/dev/null) \
-        > /host/.vm-cache/vm-build.log 2>&1 \
-    && touch /host/.vm-cache/vm-build.done \
-    || touch /host/.vm-cache/vm-build.failed
+echo "=== [vm] running _vm-builder.sh ==="
+if sh /host/_vm-builder.sh $(cat /host/.vm-cache/vm-args 2>/dev/null) \
+        > /host/.vm-cache/vm-build.log 2>&1; then
+    touch /host/.vm-cache/vm-build.done
+    echo "=== [vm] builder succeeded ==="
+else
+    touch /host/.vm-cache/vm-build.failed
+    echo "=== [vm] builder FAILED ==="
+    tail -n 20 /host/.vm-cache/vm-build.log
+fi
 
 sync
 poweroff -f
@@ -117,24 +169,19 @@ chmod +x "$OVL_TMP/etc/local.d/99-ext4.start"
 # Enable the `local` service so OpenRC runs /etc/local.d/*.start at boot.
 ln -sf /etc/init.d/local "$OVL_TMP/etc/runlevels/default/local"
 
-# Apkovl must be a .tar.gz whose filename matches a hostname the
-# overlay applies to. Alpine init also accepts a generic filename
-# via the `apkovl=` boot option, which is what we use below.
-rm -f "$CACHE/ovl.apkovl.tar.gz" "$CACHE/vm-build.done" "$CACHE/vm-build.failed" "$CACHE/vm-build.log"
-(cd "$OVL_TMP" && tar -czf "$CACHE/ovl.apkovl.tar.gz" etc)
+# Apkovl: Alpine auto-applies a .tar.gz file named
+# `${HOSTNAME}.apkovl.tar.gz` (default HOSTNAME=localhost) found on
+# any mounted filesystem at boot. We wrap it inside a tiny ISO9660
+# image so qemu can attach it as a 2nd virtual CDROM — Alpine's
+# init will mount the CDROM and apply the overlay without any
+# `apkovl=` kernel cmdline argument.
+OVL_STAGE="$CACHE/ovl-iso-stage"
+rm -rf "$OVL_STAGE" "$CACHE/ovl.iso" "$CACHE/vm-build.done" "$CACHE/vm-build.failed" "$CACHE/vm-build.log"
+mkdir -p "$OVL_STAGE"
+(cd "$OVL_TMP" && tar -czf "$OVL_STAGE/localhost.apkovl.tar.gz" etc)
+bsdtar -c -f "$CACHE/ovl.iso" --format=iso9660 -C "$OVL_STAGE" .
 
-# ---------------------------------------------------------------------------
-# Step 3 — serve the apkovl over a throwaway localhost HTTP server so
-# Alpine's init can fetch it via qemu's NAT gateway (10.0.2.2).
-# ---------------------------------------------------------------------------
-HTTP_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
-python3 -m http.server "$HTTP_PORT" --directory "$CACHE" --bind 127.0.0.1 >/dev/null 2>&1 &
-HTTP_PID=$!
-sleep 0.3
-cleanup() {
-    kill "$HTTP_PID" 2>/dev/null || true
-}
-trap cleanup EXIT
+# (No HTTP server needed — the apkovl rides in on the 2nd CDROM.)
 
 # ---------------------------------------------------------------------------
 # Step 4 — boot Alpine under qemu with a 9p share of this directory.
@@ -148,10 +195,10 @@ printf '%s\n' "$@" > "$CACHE/vm-args"
 qemu-system-x86_64 \
     -kernel "$CACHE/vmlinuz-virt" \
     -initrd "$CACHE/initramfs-virt" \
-    -append "console=ttyS0 modules=loop,squashfs,sd-mod,usb-storage,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio ip=dhcp apkovl=http://10.0.2.2:${HTTP_PORT}/ovl.apkovl.tar.gz" \
-    -drive file="$CACHE/alpine-virt.iso",media=cdrom,readonly=on \
+    -append "console=ttyS0 modules=loop,squashfs,sd-mod,usb-storage,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio" \
+    -drive file="$CACHE/alpine-virt.iso",media=cdrom,readonly=on,if=ide,index=0 \
+    -drive file="$CACHE/ovl.iso",media=cdrom,readonly=on,if=ide,index=1 \
     -virtfs local,path="$SCRIPT_DIR",mount_tag=host,security_model=mapped-xattr,id=host \
-    -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
     -m 1024 \
     -smp 2 \
     -nographic \
