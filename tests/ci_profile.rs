@@ -409,25 +409,34 @@ fn parse_workflow(text: &str) -> Workflow {
     Workflow { triggers, jobs }
 }
 
-/// Does this workflow still run on a pull request at all?
+/// Does this workflow still run on a pull request?
 ///
 /// The assumption the `ci.yml`-only scope rests on, and a fact about
 /// the file rather than a given: if the triggers stop including
 /// `pull_request`, the step gates nothing however it looks.
+///
+/// Matched against the parsed trigger NAMES, whole -- a substring
+/// search over the `on:` block's raw text said yes to
+/// `pull_request_review:`, and to a `pull_request` inside a comment.
+///
+/// `pull_request_target` DOES NOT COUNT, and that is a decision rather
+/// than an oversight. It is a pull-request trigger, but it runs in the
+/// BASE repository's context with write-scoped secrets, and
+/// `actions/checkout` there takes the base branch unless a `ref:` says
+/// otherwise -- so a gate under it can pass having executed none of the
+/// code under review.
+///
+/// The alternative was to accept it alongside a checkout naming the
+/// head. That was implemented, and then measured against reality:
+/// `pull_request_target` appears in ZERO workflows across all twelve
+/// repositories. The conditional branch guarded a configuration that
+/// does not exist, which is machinery to be maintained, and
+/// mis-maintained, on behalf of nothing. Refusing outright makes
+/// adopting the trigger a deliberate act with a loud failure, which is
+/// the right direction for a library crate that has no use for a write
+/// token.
 fn runs_on_pull_request(wf: &Workflow) -> bool {
-    // MATCHED WHOLE, against parsed trigger names. A substring search
-    // over the `on:` block's text answered `true` for
-    // `pull_request_review:` -- which fires on review events, not on a
-    // pull request opening or being pushed to, so it gates nothing --
-    // and for `pull_request` inside a comment, including the comment
-    // that says it was switched off.
-    //
-    // `pull_request_target` IS included, deliberately: it runs on pull
-    // requests, in the base-repository context, and can be a required
-    // check. It is named rather than matched by prefix.
-    wf.triggers
-        .iter()
-        .any(|t| t == "pull_request" || t == "pull_request_target")
+    wf.triggers.iter().any(|t| t == "pull_request")
 }
 
 /// Keys whose presence on a step or job means its result does not gate.
@@ -631,25 +640,53 @@ jobs:
         );
     }
 
-    /// `pull_request_target` IS A PULL-REQUEST TRIGGER, so the
-    /// substring match in `runs_on_pull_request` counting it is
-    /// deliberate rather than sloppy.
+    /// `pull_request_target` IS A PULL-REQUEST TRIGGER, AND IT DOES
+    /// NOT COUNT.
     ///
-    /// Pinned because it reads like a bug and was mistaken for one
-    /// while witnessing this fix: a mutation replacing `pull_request:`
-    /// with `pull_request_target:` left the guard green and looked
-    /// like a survivor. It is not -- such a workflow still runs on
-    /// pull requests, in the base-repository context, and can still be
-    /// a required check. The defeat that matters is the trigger going
-    /// away, which the test above covers by removing it.
+    /// It runs in the BASE repository's context, with write-scoped
+    /// secrets, and `actions/checkout` there takes the base branch
+    /// unless a `ref:` says otherwise -- so a gate under it can run,
+    /// pass, and have executed none of the code under review.
+    ///
+    /// A conditional form was written first: accept the trigger
+    /// alongside a checkout naming `github.event.pull_request.head.sha`
+    /// or `.head.ref`. It works, and it was dropped anyway, because
+    /// `pull_request_target` appears in ZERO workflows across the
+    /// twelve repositories -- so the branch guarded a configuration
+    /// that does not exist. Refusing is a smaller thing to maintain and
+    /// makes adopting the trigger a deliberate act with a loud failure.
+    ///
+    /// Note the narrowness of what this refuses: a workflow carrying
+    /// BOTH `pull_request:` and `pull_request_target:` is satisfied by
+    /// the former and never reaches this. Only a merge gate triggered
+    /// solely by `pull_request_target` fails, and that is the case
+    /// worth a human's attention.
     #[test]
-    fn a_pull_request_target_trigger_still_gates() {
+    fn a_pull_request_target_trigger_alone_does_not_gate() {
         let yaml = GATING.replace("  pull_request:\n", "  pull_request_target:\n");
+        assert_ne!(yaml, GATING, "the mutation must actually apply");
+        assert!(
+            gating(&yaml).is_empty(),
+            "a gate triggered only by pull_request_target runs against the base branch \
+             by default, so it does not gate the pull request's own code"
+        );
+    }
+
+    /// AND IT IS NOT A REFUSAL OF THE WORKFLOW, only of that trigger
+    /// standing alone. The pair is the ordinary way to reach secrets
+    /// without giving up the gate, and it must keep gating.
+    #[test]
+    fn a_workflow_carrying_both_triggers_still_gates() {
+        let yaml = GATING.replace(
+            "  pull_request:\n",
+            "  pull_request:\n  pull_request_target:\n",
+        );
         assert_ne!(yaml, GATING, "the mutation must actually apply");
         assert_eq!(
             gating(&yaml).len(),
             1,
-            "pull_request_target runs on a pull request too, so a step under it gates"
+            "`pull_request:` is present, so the workflow gates; the extra trigger is \
+             not a disqualification"
         );
     }
 
