@@ -1254,7 +1254,13 @@ impl Filesystem {
     pub fn apply_chmod(&self, path: &str, mode: u16) -> Result<()> {
         self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            path,
+            &self.csum,
+        )?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
 
         // Preserve file-type bits (high 4 bits of i_mode); only the low 12
@@ -2022,7 +2028,13 @@ impl Filesystem {
     pub fn apply_chown(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
         self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            path,
+            &self.csum,
+        )?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
 
         if uid != u32::MAX {
@@ -2056,7 +2068,13 @@ impl Filesystem {
         use crate::inode::{InodeFlags, OFF_CTIME, OFF_FLAGS};
         self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            path,
+            &self.csum,
+        )?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
 
         let managed = InodeFlags::EXTENTS.bits()
@@ -2096,7 +2114,13 @@ impl Filesystem {
     pub fn apply_removexattr(&self, path: &str, name: &str) -> Result<()> {
         self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            path,
+            &self.csum,
+        )?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
 
         // Locate the in-inode xattr region (starts at 128 + i_extra_isize).
@@ -2180,7 +2204,13 @@ impl Filesystem {
     pub fn apply_setxattr(&self, path: &str, name: &str, value: &[u8]) -> Result<()> {
         self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            path,
+            &self.csum,
+        )?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
 
         let inode_size = self.sb.inode_size as usize;
@@ -2369,7 +2399,13 @@ impl Filesystem {
             }
         }
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            path,
+            &self.csum,
+        )?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
 
         let (atime_base, atime_epoch) = crate::inode::encode_extra_time(atime_sec);
@@ -2455,14 +2491,20 @@ impl Filesystem {
 
         // Resolve parent + target inodes.
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let parent_ino_num =
-            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_ino)?;
+        let parent_ino_num = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            &parent_ino,
+            &self.csum,
+        )?;
         let (parent_inode, _parent_raw) = self.read_inode_verified(parent_ino_num)?;
         if !parent_inode.is_dir() {
             return Err(Error::NotADirectory);
         }
 
-        let target_ino = self.find_entry_in_dir(&parent_inode, base_name.as_bytes())?;
+        let target_ino =
+            self.find_entry_in_dir(parent_ino_num, &parent_inode, base_name.as_bytes())?;
         let (target_inode, mut target_raw) = self.read_inode_verified(target_ino)?;
         if target_inode.is_dir() {
             // POSIX: unlink(2) on a directory must fail with EISDIR; the
@@ -2579,16 +2621,18 @@ impl Filesystem {
         }
 
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let parent_ino =
-            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
+        let parent_ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            &parent_path,
+            &self.csum,
+        )?;
         let (parent_inode, _) = self.read_inode_verified(parent_ino)?;
         if !parent_inode.is_dir() {
             return Err(Error::NotADirectory);
         }
-        if self
-            .find_entry_in_dir(&parent_inode, base_name.as_bytes())
-            .is_ok()
-        {
+        if self.entry_exists(parent_ino, &parent_inode, base_name.as_bytes())? {
             return Err(Error::AlreadyExists);
         }
 
@@ -3032,7 +3076,13 @@ impl Filesystem {
     pub fn apply_replace_file_content(&self, path: &str, data: &[u8]) -> Result<u64> {
         self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            path,
+            &self.csum,
+        )?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
         if !inode.is_file() {
             return Err(Error::InvalidArgument(
@@ -3314,7 +3364,13 @@ impl Filesystem {
     pub fn apply_pwrite(&self, path: &str, offset: u64, data: &[u8]) -> Result<u64> {
         self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            path,
+            &self.csum,
+        )?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
         if !inode.is_file() {
             return Err(Error::InvalidArgument(
@@ -3727,9 +3783,71 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Refuse a directory block whose tail checksum does not verify, before
+    /// anything reads entries out of it.
+    ///
+    /// THE WRITE ENGINE WALKS BLOCKS WITH `DirBlockIter`, WHICH TAKES NO
+    /// `Checksummer`. The read path goes through `dir::parse_block_verified`,
+    /// which does; the three scans in this file that find the entry a
+    /// mutation is about to edit did not. So on a `metadata_csum` volume a
+    /// corrupt directory block was refused by `stat` and accepted by
+    /// `unlink`, `rename`, `mkdir`, `rmdir`, `link`, `chmod` and the rest.
+    ///
+    /// AND THE EDIT RE-STAMPED IT. Every one of those paths calls
+    /// `patch_dir_entry_tail` after editing the block, computing a fresh and
+    /// correct CRC32C over the corrupted contents — so before the write the
+    /// damage was detectable and after it, nothing in this crate could see
+    /// it. The defect destroyed the evidence of what it had failed to check.
+    ///
+    /// Same predicate as `dir::parse_block_verified` (`dir.rs`), deliberately:
+    /// `csum.enabled` AND a recognisable tail. A volume without the feature,
+    /// and a block predating the tail, are both parsed exactly as before.
+    fn refuse_unverified_dir_block(&self, ino: u32, generation: u32, block: &[u8]) -> Result<()> {
+        if self.csum.enabled
+            && crate::dir::has_csum_tail(block)
+            && !self.csum.verify_dir_entry_tail(ino, generation, block)
+        {
+            return Err(Error::BadChecksum {
+                what: "directory block",
+            });
+        }
+        Ok(())
+    }
+
+    /// Does `name` already exist in `dir_inode`?
+    ///
+    /// NOT `find_entry_in_dir(..).is_ok()`. That spelling maps EVERY error to
+    /// "absent", including the `BadChecksum` this scan now raises — so
+    /// `mkdir` on a directory whose block was corrupt concluded the name was
+    /// free, added an entry to the block it had just failed to verify, and
+    /// re-stamped a valid checksum over it. Verifying the block and then
+    /// discarding the verdict is worse than not verifying, because it reads
+    /// as protection.
+    ///
+    /// FOUR SITES DID IT, AND A GREP FINDS THREE. `plan_new_inode_in_dir`,
+    /// `apply_mkdir` and `apply_link` wrote `.is_ok()`; `apply_rename` wrote
+    /// `.ok()` on the destination check, which discards identically. The
+    /// fourth is handled where it is, because rename needs the inode number
+    /// rather than a yes/no, but it is the same defect and it is why this
+    /// doc comment names the count instead of leaving it to a search.
+    ///
+    /// Only `NotFound` means absent. Everything else propagates.
+    fn entry_exists(&self, dir_ino: u32, dir_inode: &Inode, name: &[u8]) -> Result<bool> {
+        match self.find_entry_in_dir(dir_ino, dir_inode, name) {
+            Ok(_) => Ok(true),
+            Err(Error::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Find `name` in directory `dir_inode` — scans each data block. Returns
     /// the inode number or `Error::NotFound`.
-    fn find_entry_in_dir(&self, dir_inode: &Inode, name: &[u8]) -> Result<u32> {
+    ///
+    /// TAKES THE INODE NUMBER as well as the inode, and only because the
+    /// checksum seed needs it: the tail is `crc32c(seed, ino || generation ||
+    /// block)`, so a scan that has only the `Inode` cannot verify what it is
+    /// reading. Every caller already had the number in scope.
+    fn find_entry_in_dir(&self, dir_ino: u32, dir_inode: &Inode, name: &[u8]) -> Result<u32> {
         let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
         let bs = self.sb.block_size();
         let n_blocks = dir_inode.size.div_ceil(bs as u64);
@@ -3738,6 +3856,7 @@ impl Filesystem {
                 continue;
             };
             let block = self.read_block(phys)?;
+            self.refuse_unverified_dir_block(dir_ino, dir_inode.generation, &block)?;
             for entry in crate::dir::DirBlockIter::new(&block, has_ft) {
                 let e = entry?;
                 if e.name == name {
@@ -4033,16 +4152,18 @@ impl Filesystem {
         }
 
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let parent_ino =
-            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
+        let parent_ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            &parent_path,
+            &self.csum,
+        )?;
         let (parent_inode, mut parent_raw) = self.read_inode_verified(parent_ino)?;
         if !parent_inode.is_dir() {
             return Err(Error::NotADirectory);
         }
-        if self
-            .find_entry_in_dir(&parent_inode, base_name.as_bytes())
-            .is_ok()
-        {
+        if self.entry_exists(parent_ino, &parent_inode, base_name.as_bytes())? {
             return Err(Error::AlreadyExists);
         }
 
@@ -4167,7 +4288,13 @@ impl Filesystem {
         }
 
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let src_ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, src)?;
+        let src_ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            src,
+            &self.csum,
+        )?;
         let (src_inode, mut src_raw) = self.read_inode_verified(src_ino)?;
         if src_inode.is_dir() {
             // POSIX: hard-linking a directory is forbidden. Map to EISDIR
@@ -4175,16 +4302,18 @@ impl Filesystem {
             return Err(Error::IsADirectory);
         }
 
-        let dst_parent_ino =
-            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &dst_parent_path)?;
+        let dst_parent_ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            &dst_parent_path,
+            &self.csum,
+        )?;
         let (dst_parent_inode, _) = self.read_inode_verified(dst_parent_ino)?;
         if !dst_parent_inode.is_dir() {
             return Err(Error::NotADirectory);
         }
-        if self
-            .find_entry_in_dir(&dst_parent_inode, dst_name.as_bytes())
-            .is_ok()
-        {
+        if self.entry_exists(dst_parent_ino, &dst_parent_inode, dst_name.as_bytes())? {
             return Err(Error::AlreadyExists);
         }
 
@@ -4292,20 +4421,37 @@ impl Filesystem {
         }
 
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let src_parent_ino =
-            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &src_parent_path)?;
-        let dst_parent_ino =
-            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &dst_parent_path)?;
+        let src_parent_ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            &src_parent_path,
+            &self.csum,
+        )?;
+        let dst_parent_ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            &dst_parent_path,
+            &self.csum,
+        )?;
         let (src_parent_inode, _) = self.read_inode_verified(src_parent_ino)?;
         let (dst_parent_inode, _) = self.read_inode_verified(dst_parent_ino)?;
         if !src_parent_inode.is_dir() || !dst_parent_inode.is_dir() {
             return Err(Error::NotADirectory);
         }
 
-        let src_ino = self.find_entry_in_dir(&src_parent_inode, src_name.as_bytes())?;
-        let existing_dst_ino = self
-            .find_entry_in_dir(&dst_parent_inode, dst_name.as_bytes())
-            .ok();
+        let src_ino =
+            self.find_entry_in_dir(src_parent_ino, &src_parent_inode, src_name.as_bytes())?;
+        // `.ok()` here for the same reason as `entry_exists` above: it turned
+        // a refusal to read the block into "dst does not exist", and rename
+        // then created it and re-stamped the block.
+        let existing_dst_ino =
+            match self.find_entry_in_dir(dst_parent_ino, &dst_parent_inode, dst_name.as_bytes()) {
+                Ok(ino) => Some(ino),
+                Err(Error::NotFound) => None,
+                Err(e) => return Err(e),
+            };
         if existing_dst_ino.is_some() && !replace_if_exists {
             return Err(Error::AlreadyExists);
         }
@@ -4373,6 +4519,13 @@ impl Filesystem {
                         continue;
                     };
                     let block = self.read_block(phys)?;
+                    // The block this branch is about to overwrite. Unverified
+                    // here, it would be emptied and re-stamped valid.
+                    self.refuse_unverified_dir_block(
+                        dst_old_ino,
+                        dst_old_inode.generation,
+                        &block,
+                    )?;
                     for entry in crate::dir::DirBlockIter::new(&block, has_ft) {
                         let e = entry?;
                         if e.name != b"." && e.name != b".." {
@@ -5122,13 +5275,18 @@ impl Filesystem {
         self.refuse_write()?;
         let (parent_path, base_name) = split_parent_and_base(path)?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let parent_ino =
-            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
+        let parent_ino = crate::path::lookup_with_csum(
+            self.dev.as_ref(),
+            &self.sb,
+            &mut reader,
+            &parent_path,
+            &self.csum,
+        )?;
         let (parent_inode, mut parent_raw) = self.read_inode_verified(parent_ino)?;
         if !parent_inode.is_dir() {
             return Err(Error::NotADirectory);
         }
-        let target_ino = self.find_entry_in_dir(&parent_inode, base_name.as_bytes())?;
+        let target_ino = self.find_entry_in_dir(parent_ino, &parent_inode, base_name.as_bytes())?;
         let (target_inode, _) = self.read_inode_verified(target_ino)?;
         if !target_inode.is_dir() {
             return Err(Error::NotADirectory);
@@ -5145,6 +5303,10 @@ impl Filesystem {
                 continue;
             };
             let block = self.read_block(phys)?;
+            // The emptiness decision is made from this block's contents, and
+            // the block is then freed. Unverified, a corrupt one reads as
+            // empty or not-empty by accident.
+            self.refuse_unverified_dir_block(target_ino, target_inode.generation, &block)?;
             for entry in crate::dir::DirBlockIter::new(&block, has_ft) {
                 let e = entry?;
                 if e.name != b"." && e.name != b".." {

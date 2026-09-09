@@ -48,6 +48,20 @@ where
     // Backwards-compatible shim — defers to `lookup_with_csum` with a
     // disabled `Checksummer` so callers that don't have one keep working
     // (verification is silently skipped).
+    //
+    // FOR CALLERS THAT GENUINELY HAVE NO `Checksummer`, AND NOTHING ELSE.
+    // Sixteen sites in `fs.rs` used this from inside methods holding
+    // `&self`, and therefore holding `self.csum` — so every mutating C
+    // entry point resolved its path with verification off, while
+    // `capi::resolve_path` resolved with it on. A corrupt directory block
+    // was refused by `stat` and accepted by `unlink`, `rename`, `mkdir`,
+    // `rmdir`, `link`, `chmod` and the rest, which then edited the block
+    // and re-stamped a fresh valid checksum over it.
+    //
+    // THE SEED IS WRONG AS WELL AS THE FLAG, which is why the remedy is
+    // to pass the real `Checksummer` and never to flip `enabled` here:
+    // `seed: 0` would verify good blocks against the wrong seed and
+    // reject them.
     let csum = crate::checksum::Checksummer {
         seed: 0,
         enabled: false,
