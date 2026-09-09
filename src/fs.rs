@@ -837,6 +837,54 @@ impl Filesystem {
     /// other bytes (including the extent tree header + entries in `i_block`)
     /// intact. `new_block_count` is in 512-byte sectors per spec (same
     /// convention as `Inode::blocks`).
+    /// Write `i_file_acl` — the external xattr block pointer — into a raw
+    /// inode. `block_nr` of 0 clears it.
+    ///
+    /// THE HIGH HALF IS AT 0x76, NOT 0x74. `Inode::parse` reads
+    /// `i_file_acl_hi` from `0x76..0x78`; both writers here put it at
+    /// `0x74..0x76`, which is `l_i_blocks_hi`. And
+    /// `patch_inode_size_and_blocks` — which owns that field — ran six
+    /// lines later at both sites and overwrote it. So the high half was
+    /// never written and never cleared, by either of the two functions
+    /// that thought they were maintaining it.
+    ///
+    /// WHY IT LEFT NO TRACE. Below 2^32 blocks the high half is 0, the
+    /// clobber writes 0 over 0, and the field was already 0. Above it —
+    /// 16 TiB at 4 KiB blocks — a fresh external block keeps only its low
+    /// 32 bits, so `Inode::parse` reads back a DIFFERENT block, which
+    /// `xattr::list` then reads and `apply_removexattr` WRITES; and a
+    /// freed one leaves `file_acl == old_hi << 32` pointing at a block
+    /// already handed back to the allocator.
+    ///
+    /// ONE RECIPE, TWO CALLERS, which is the other half of why this
+    /// survived: the offset was written out by hand at each site and
+    /// nothing made the two agree with the reader.
+    ///
+    /// The length guard is `>= 0x78`, not `>= 0x76`: the old one admitted
+    /// a buffer ending exactly where the field it was about to write
+    /// begins. An inode too short to hold the high half is REFUSED when
+    /// the block number needs one, rather than silently storing a pointer
+    /// to somewhere else — that truncation is what this function exists
+    /// to end.
+    pub(crate) fn write_file_acl(raw: &mut [u8], block_nr: u64) -> Result<()> {
+        if raw.len() < 0x6C {
+            return Err(Error::Corrupt(
+                "write_file_acl: inode buffer too small for i_file_acl_lo",
+            ));
+        }
+        let (hi, lo) = crate::extent_mut::split_phys_block(block_nr);
+        raw[0x68..0x6C].copy_from_slice(&lo.to_le_bytes());
+        if raw.len() >= 0x78 {
+            raw[0x76..0x78].copy_from_slice(&hi.to_le_bytes());
+        } else if hi != 0 {
+            return Err(Error::Corrupt(
+                "write_file_acl: this inode is too small to hold i_file_acl_hi and the \
+                 external xattr block needs it",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn patch_inode_size_and_blocks(
         raw: &mut [u8],
         new_size: u64,
@@ -2171,10 +2219,8 @@ impl Filesystem {
                     let mut buf = BlockBuffer::new(bs);
                     self.buffer_free_block_run_and_bgd(&mut buf, block_nr, 1)?;
                     self.buffer_patch_sb_counters(&mut buf, 1, 0)?;
-                    raw[0x68..0x6C].copy_from_slice(&0u32.to_le_bytes());
-                    if raw.len() >= 0x76 {
-                        raw[0x74..0x76].copy_from_slice(&0u16.to_le_bytes());
-                    }
+                    // Both halves, at the offsets the reader uses.
+                    Self::write_file_acl(&mut raw, 0)?;
                     let sectors_per_block = bs_u64 / 512;
                     let new_blocks = inode.blocks.saturating_sub(sectors_per_block);
                     Self::patch_inode_size_and_blocks(&mut raw, inode.size, new_blocks)?;
@@ -2329,13 +2375,10 @@ impl Filesystem {
             plan.sb.free_inodes_delta,
         )?;
 
-        // Splice block_nr into the inode: i_file_acl_lo at 0x68..0x6C, hi
-        // at 0x74..0x76.
-        let (acl_hi, acl_lo) = crate::extent_mut::split_phys_block(block_nr);
-        raw[0x68..0x6C].copy_from_slice(&acl_lo.to_le_bytes());
-        if raw.len() >= 0x76 {
-            raw[0x74..0x76].copy_from_slice(&acl_hi.to_le_bytes());
-        }
+        // Splice block_nr into the inode: i_file_acl_lo at 0x68..0x6C, hi at
+        // 0x76..0x78. The comment here used to say 0x74, and so did the
+        // code, so a reader checking one against the other agreed.
+        Self::write_file_acl(raw, block_nr)?;
         // Bump i_blocks by sectors_per_block (the xattr block now belongs
         // to this inode for du purposes).
         let sectors_per_block = bs_u64 / 512;
@@ -6177,6 +6220,228 @@ mod tests {
             fs.sb.free_blocks_count,
             before_free + 3,
             "only the three blocks past the new EOF should have been freed"
+        );
+    }
+
+    // --- i_file_acl: written where it is read -------------------------
+    //
+    // THE OBVIOUS TEST IS NOT ENOUGH, and this is the whole reason the
+    // defect survived. A round trip on a small image passes today: below
+    // 2^32 blocks both halves of `i_file_acl` are zero, the wrong offset
+    // is clobbered with zero over zero, and nothing disagrees. The block
+    // number has to have bits above 32 set.
+    //
+    // Driven against a synthetic 256-byte inode rather than a 16 TiB
+    // filesystem, because what is being tested is which BYTES the two
+    // writers touch, and that is answerable without the volume.
+
+    /// A 256-byte inode with a plausible extra_isize, so `Inode::parse`
+    /// reads it the way it reads a real one.
+    fn synthetic_inode() -> Vec<u8> {
+        let mut raw = vec![0u8; 256];
+        raw[0x00..0x02].copy_from_slice(&0x81A4u16.to_le_bytes()); // S_IFREG | 0644
+        raw[OFF_EXTRA_ISIZE..OFF_EXTRA_ISIZE + 2]
+            .copy_from_slice(&EXTRA_ISIZE_DEFAULT.to_le_bytes());
+        raw
+    }
+
+    /// THE DEFECT. A block number above 2^32 must survive the write.
+    ///
+    /// `patch_inode_size_and_blocks` runs after the splice at both real
+    /// call sites and owns `0x74..0x76`, so it is run here too: with the
+    /// old offset the high half was written and then immediately
+    /// overwritten, and a test that skipped this call would have passed
+    /// against the broken code.
+    #[test]
+    fn a_file_acl_block_above_2_32_survives_patch_inode_size_and_blocks() {
+        let block: u64 = 0x0003_1234_5678; // bits above 32 set
+        let mut raw = synthetic_inode();
+
+        Filesystem::write_file_acl(&mut raw, block).expect("write_file_acl");
+        Filesystem::patch_inode_size_and_blocks(&mut raw, 4096, 0x0000_0002_0000_0008)
+            .expect("patch_inode_size_and_blocks");
+
+        let inode = Inode::parse(&raw).expect("parse");
+        assert_eq!(
+            inode.file_acl, block,
+            "i_file_acl read back as {:#x}, written as {:#x} — the high half is at \
+             0x76..0x78 and the low at 0x68..0x6C",
+            inode.file_acl, block
+        );
+    }
+
+    /// THE FREE CONTROL the issue named: a fix that over-corrects by
+    /// moving the wrong field fails here.
+    ///
+    /// `i_blocks_hi` still belongs to `patch_inode_size_and_blocks`, and
+    /// the splice must not touch it. Without this, writing `i_file_acl_hi`
+    /// to `0x74` and `i_blocks_hi` to `0x76` would satisfy the test above
+    /// by symmetry.
+    #[test]
+    fn the_splice_leaves_i_blocks_hi_to_the_function_that_owns_it() {
+        let mut raw = synthetic_inode();
+        Filesystem::patch_inode_size_and_blocks(&mut raw, 4096, 0x0000_0002_0000_0008)
+            .expect("patch");
+        let blocks_hi_before = read_le16(&raw, 0x74);
+        assert_eq!(
+            blocks_hi_before, 2,
+            "the fixture must set a nonzero blocks_hi"
+        );
+
+        Filesystem::write_file_acl(&mut raw, 0x0003_1234_5678).expect("write_file_acl");
+        assert_eq!(
+            read_le16(&raw, 0x74),
+            blocks_hi_before,
+            "the file_acl splice wrote i_blocks_hi (0x74..0x76), which belongs to \
+             patch_inode_size_and_blocks"
+        );
+        assert_eq!(
+            Inode::parse(&raw).expect("parse").blocks,
+            0x0000_0002_0000_0008,
+            "and i_blocks reads back unchanged"
+        );
+    }
+
+    /// Clearing it clears BOTH halves. The free path zeroed only the low
+    /// one, leaving `file_acl == old_hi << 32` — a nonzero pointer at a
+    /// block just handed back to the allocator.
+    #[test]
+    fn clearing_file_acl_clears_the_high_half_too() {
+        // THE STARTING STATE IS WRITTEN BY HAND, at the offsets the
+        // on-disk format uses, because that is the inode this driver is
+        // handed: one Linux or mkfs wrote with a real high half. Using
+        // `write_file_acl` to set it up would make the test agree with
+        // whatever offset that function happens to use, and a truncating
+        // writer followed by a truncating clear reads back 0 either way.
+        let mut raw = synthetic_inode();
+        raw[0x68..0x6C].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        raw[0x76..0x78].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(
+            Inode::parse(&raw).expect("parse").file_acl,
+            0x0003_1234_5678,
+            "the fixture must present an inode whose file_acl needs both halves"
+        );
+
+        Filesystem::write_file_acl(&mut raw, 0).expect("clear");
+        Filesystem::patch_inode_size_and_blocks(&mut raw, 4096, 0x0000_0002_0000_0008)
+            .expect("patch");
+        assert_eq!(
+            Inode::parse(&raw).expect("parse").file_acl,
+            0,
+            "a freed external xattr block must leave no pointer behind — clearing only \
+             i_file_acl_lo leaves file_acl == old_hi << 32, at a block already handed \
+             back to the allocator"
+        );
+    }
+
+    /// The low half on its own still round-trips, so a volume under
+    /// 2^32 blocks — every volume this has ever run on — is unaffected.
+    #[test]
+    fn a_small_file_acl_block_round_trips_as_it_always_did() {
+        let mut raw = synthetic_inode();
+        Filesystem::write_file_acl(&mut raw, 0x1234_5678).expect("write_file_acl");
+        Filesystem::patch_inode_size_and_blocks(&mut raw, 4096, 8).expect("patch");
+        assert_eq!(Inode::parse(&raw).expect("parse").file_acl, 0x1234_5678);
+    }
+
+    /// The length guard. `>= 0x76` admitted a buffer ending exactly where
+    /// the field starts; and an inode that cannot hold the high half must
+    /// refuse a block number that needs one rather than store a pointer
+    /// to a different block.
+    #[test]
+    fn an_inode_too_short_for_the_high_half_refuses_a_block_that_needs_one() {
+        let mut short = vec![0u8; 0x76];
+        assert!(
+            Filesystem::write_file_acl(&mut short, 0x0003_1234_5678).is_err(),
+            "a 0x76-byte inode has no room for 0x76..0x78 and must not truncate"
+        );
+
+        // ...but a block number that fits in 32 bits is fine there, which
+        // is what makes the refusal a bound rather than a blanket no.
+        let mut short = vec![0u8; 0x76];
+        Filesystem::write_file_acl(&mut short, 0x1234_5678).expect("the low half fits");
+        assert_eq!(read_le32(&short, 0x68), 0x1234_5678);
+
+        let mut tiny = vec![0u8; 0x6B];
+        assert!(
+            Filesystem::write_file_acl(&mut tiny, 0).is_err(),
+            "a buffer too short for even the low half must be refused"
+        );
+    }
+
+    /// ONE RECIPE, AND THE TESTS ABOVE CANNOT SEE A SECOND ONE.
+    ///
+    /// Everything above drives `write_file_acl` directly. Re-inlining the
+    /// splice at either call site — which is the state this file was in —
+    /// leaves all of them green, because they never execute a call site.
+    /// Reaching one needs a filesystem above 2^32 blocks, i.e. a 16 TiB
+    /// image, which is not a test anyone will run.
+    ///
+    /// So this reads the source instead and requires each offset to be
+    /// written in exactly one place: `0x74..0x76` only by
+    /// `patch_inode_size_and_blocks`, which owns `i_blocks_hi`, and
+    /// `0x76..0x78` only by `write_file_acl`. A hand-written second copy
+    /// of either is what let the two disagree with `Inode::parse` for as
+    /// long as they did.
+    #[test]
+    fn each_inode_half_word_is_written_in_exactly_one_place() {
+        let whole = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fs.rs"))
+            .expect("src/fs.rs is readable");
+
+        // ONLY THE SHIPPING HALF. This module writes those offsets by hand
+        // to build fixtures, and counting its own fixtures as writers made
+        // the check fail the moment a test was added — which is a guard
+        // that reports a defect it has manufactured. The split is on the
+        // `#[cfg(test)]` that begins this module.
+        let cut = whole
+            .find("\n#[cfg(test)]\n")
+            .expect("src/fs.rs has a #[cfg(test)] module, which is where this test lives");
+        let src = &whole[..cut];
+        assert!(
+            src.contains("fn patch_inode_size_and_blocks"),
+            "the non-test half must still contain the writers, or a count of 1 means \
+             the split ate the file"
+        );
+
+        let writes = |field: &str| -> Vec<String> {
+            src.lines()
+                .filter(|l| l.contains(field) && l.contains("copy_from_slice"))
+                .map(str::trim)
+                .map(str::to_owned)
+                .collect()
+        };
+
+        let blocks_hi = writes("0x74..0x76");
+        assert_eq!(
+            blocks_hi.len(),
+            1,
+            "i_blocks_hi (0x74..0x76) is written {} times; it belongs to \
+             patch_inode_size_and_blocks alone. Found: {blocks_hi:?}",
+            blocks_hi.len()
+        );
+        assert!(
+            blocks_hi[0].contains("blocks_hi"),
+            "the one 0x74..0x76 write must be the i_blocks_hi one: {:?}",
+            blocks_hi[0]
+        );
+
+        let file_acl_hi = writes("0x76..0x78");
+        assert_eq!(
+            file_acl_hi.len(),
+            1,
+            "i_file_acl_hi (0x76..0x78) is written {} times; write_file_acl is the one \
+             place. Found: {file_acl_hi:?}",
+            file_acl_hi.len()
+        );
+
+        // The control: this reader can see a write at all, so a count of
+        // 1 means one and not a pattern that matches nothing.
+        let file_acl_lo = writes("0x68..0x6C");
+        assert_eq!(
+            file_acl_lo.len(),
+            1,
+            "i_file_acl_lo (0x68..0x6C) should also be written exactly once, by the same \
+             function. Found: {file_acl_lo:?}"
         );
     }
 }
