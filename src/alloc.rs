@@ -263,6 +263,32 @@ fn mark_reserved_in_group(
     }
 }
 
+/// Every block a transaction has already spoken for: the data plan's
+/// whole run, plus the whole run of every meta plan handed out so far.
+///
+/// THE LIST IS A FUNCTION BECAUSE THE INLINE VERSION WAS UNWITNESSED.
+/// Three separate reverts of the inline code — dropping the data run,
+/// no-oping the meta push, and keeping only `first_block` instead of the
+/// whole `count` run — each left 278 library tests green and EXIT=0.
+/// Nothing in the suite reaches `extend_dir_and_add_entry_deep`, on any
+/// runner, so the three lines that make the fix were held by nothing.
+/// Extracted here they are three assertions instead.
+///
+/// A PLAN IS A RUN, NOT A BLOCK. `count` is 1 for every caller today,
+/// which is exactly why `first_block` alone passed every test that
+/// existed: the day a directory data page is planned as two contiguous
+/// blocks, a `first_block`-only reservation hands the second one out
+/// again as a tree node.
+pub(crate) fn reserved_blocks(
+    data: &BlockAllocationPlan,
+    handed_out: &[BlockAllocationPlan],
+) -> Vec<u64> {
+    std::iter::once(data)
+        .chain(handed_out)
+        .flat_map(|plan| (0..u64::from(plan.count)).map(move |i| plan.first_block + i))
+        .collect()
+}
+
 /// [`plan_block_allocation`], with blocks that are SPOKEN FOR BUT NOT YET
 /// COMMITTED treated as used.
 ///
@@ -556,6 +582,94 @@ pub fn apply_bitmap_write(buf: &mut [u8], w: &BitmapWrite) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- reserved_blocks -------------------------------------------
+    //
+    // THESE THREE ASSERTIONS ARE THE FIX. Before the extraction the
+    // same three decisions were inline in
+    // `Filesystem::extend_dir_and_add_entry_deep`, and each could be
+    // reverted with 278 library tests green, EXIT=0, 0 compile errors:
+    // dropping the data run, no-oping the meta push, and reserving only
+    // `first_block` instead of the whole `count` run. Nothing in the
+    // suite reaches that function on any runner, so a test there was
+    // never going to hold them.
+
+    fn mk_plan(first_block: u64, count: u32) -> BlockAllocationPlan {
+        BlockAllocationPlan {
+            first_block,
+            count,
+            bitmap: BitmapWrite {
+                bitmap_block: 0,
+                bit_start: 0,
+                count,
+                set: true,
+            },
+            bgd: BgdCounterUpdate {
+                group_idx: 0,
+                free_blocks_delta: -(count as i32),
+                free_inodes_delta: 0,
+                used_dirs_delta: 0,
+            },
+            sb: SuperblockCounterUpdate {
+                free_blocks_delta: -(count as i64),
+                free_inodes_delta: 0,
+            },
+        }
+    }
+
+    /// THE DATA PAGE IS SPOKEN FOR. Nothing has reached the bitmap yet,
+    /// so a planner told nothing returns the data block again — and on
+    /// the first call it does exactly that, because that is the block it
+    /// returned for the data page moments earlier.
+    #[test]
+    fn the_data_plan_is_reserved() {
+        assert_eq!(reserved_blocks(&mk_plan(517, 1), &[]), vec![517]);
+    }
+
+    /// A PLAN IS A RUN, NOT A BLOCK. `count` is 1 for every caller
+    /// today, which is precisely why reserving `first_block` alone
+    /// passed every test that existed. The day a directory data page is
+    /// planned as two contiguous blocks, that version hands the second
+    /// one out again as a tree node.
+    #[test]
+    fn a_multi_block_plan_reserves_its_whole_run() {
+        assert_eq!(
+            reserved_blocks(&mk_plan(100, 3), &[]),
+            vec![100, 101, 102],
+            "reserving only first_block leaves 101 and 102 free to be handed out again"
+        );
+        assert_eq!(
+            reserved_blocks(&mk_plan(100, 1), &[mk_plan(200, 4)]),
+            vec![100, 200, 201, 202, 203],
+            "a handed-out meta plan contributes its whole run too"
+        );
+    }
+
+    /// THE SECOND CALL MUST SEE THE FIRST CALL'S ANSWER. Without this
+    /// the planner reads the same unchanged bitmap and returns the same
+    /// block, it passes into `pending_meta` a second time, and two
+    /// extent-tree nodes share one physical block — silent corruption,
+    /// which is the worse of the two consequences.
+    #[test]
+    fn every_meta_plan_handed_out_so_far_is_reserved() {
+        let data = mk_plan(517, 1);
+        let first = reserved_blocks(&data, &[]);
+        assert_eq!(first, vec![517]);
+
+        let handed_out = vec![mk_plan(518, 1)];
+        let second = reserved_blocks(&data, &handed_out);
+        assert!(
+            second.contains(&518),
+            "the block the first call was given must not be offered again: {second:?}"
+        );
+        assert!(
+            second.contains(&517),
+            "and the data block stays reserved across calls: {second:?}"
+        );
+
+        let handed_out = vec![mk_plan(518, 1), mk_plan(519, 1)];
+        assert_eq!(reserved_blocks(&data, &handed_out), vec![517, 518, 519]);
+    }
 
     fn mk_sb(
         block_size: u32,

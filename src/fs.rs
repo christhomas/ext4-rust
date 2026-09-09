@@ -5108,10 +5108,6 @@ impl Filesystem {
         // into more of the first. The reservations go into the bitmap the
         // scan reads instead, via `plan_block_allocation_excluding`, and the
         // equality test is then unnecessary rather than insufficient.
-        let data_block = data_plan.first_block;
-        let mut reserved: Vec<u64> = (0..data_plan.count as u64)
-            .map(|i| data_block + i)
-            .collect();
         let mut pending_meta: Vec<crate::alloc::BlockAllocationPlan> = Vec::new();
 
         let reader = FsBlockReader { fs: self };
@@ -5122,6 +5118,11 @@ impl Filesystem {
                 self.dev.read_at(block * bs_u64, &mut buf)?;
                 Ok(buf)
             };
+            // RECOMPUTED PER CALL rather than accumulated, so the list
+            // handed to the planner is a function of the plans that
+            // exist -- one expression to test, and no state to get out
+            // of step with `pending_meta`.
+            let reserved = crate::alloc::reserved_blocks(&data_plan, &pending_meta);
             let meta_plan = crate::alloc::plan_block_allocation_excluding(
                 &self.sb,
                 &self.allocation_groups(),
@@ -5131,9 +5132,6 @@ impl Filesystem {
                 &mut bm_reader,
             )?;
             meta_block_count += 1;
-            for i in 0..meta_plan.count as u64 {
-                reserved.push(meta_plan.first_block + i);
-            }
             pending_meta.push(meta_plan);
             Ok(pending_meta.last().unwrap().first_block)
         };
