@@ -4856,9 +4856,10 @@ impl Filesystem {
 
     /// Grow a directory whose extent tree is already at depth ≥ 2.
     /// Uses `plan_insert_extent_deep` to navigate and split the tree,
-    /// allocating index-node blocks on demand via `plan_block_allocation`.
-    /// The pre-allocated data block `new_phys` is committed first so the
-    /// alloc closure won't re-use it for tree-meta blocks.
+    /// allocating index-node blocks on demand via
+    /// `plan_block_allocation_excluding`, which is told about the data
+    /// block and about every meta block already handed out -- none of
+    /// which is committed to the bitmap until every write has succeeded.
     #[allow(clippy::too_many_arguments)]
     fn extend_dir_and_add_entry_deep(
         &self,
@@ -4884,10 +4885,37 @@ impl Filesystem {
         // we gather all plans and commit them only after every write succeeds,
         // matching the late-commit ordering of extend_dir_and_add_entry_depth1.
         //
-        // To prevent alloc_fn from picking data_plan.first_block for a meta
-        // node (which plan_block_allocation could do since the bitmap is
-        // unchanged), the closure skips that block and retries once.
+        // NOTHING HERE IS COMMITTED YET, SO THE PLANNER HAS TO BE TOLD WHAT
+        // IS ALREADY SPOKEN FOR.
+        //
+        // `plan_block_allocation` reads the bitmap off the device, and this
+        // function deliberately writes nothing to it until every write has
+        // succeeded. So every call sees the same bytes and returns the same
+        // block: measured on a fresh 64 MiB image, three consecutive plans
+        // gave `517 517 517`.
+        //
+        // This used to defend itself with one equality test against
+        // `data_block`, and the comment above it claimed the closure "skips
+        // that block and retries once", which it never did -- it returned
+        // `NoSpaceLeftOnDevice`. Both halves were wrong:
+        //
+        //   - when the planner did return `data_block`, which it does on the
+        //     FIRST call because that is what it returned for the data page
+        //     moments earlier, the directory grow failed with
+        //     `NoSpaceLeftOnDevice` on a nearly empty filesystem;
+        //   - when it did not, the test passed, the block went into
+        //     `pending_meta`, and the NEXT call returned the same block,
+        //     passed the same test and went in again -- two extent-tree
+        //     nodes on one physical block, which is silent corruption.
+        //
+        // Adding `pending_meta` to that test would only turn the second case
+        // into more of the first. The reservations go into the bitmap the
+        // scan reads instead, via `plan_block_allocation_excluding`, and the
+        // equality test is then unnecessary rather than insufficient.
         let data_block = data_plan.first_block;
+        let mut reserved: Vec<u64> = (0..data_plan.count as u64)
+            .map(|i| data_block + i)
+            .collect();
         let mut pending_meta: Vec<crate::alloc::BlockAllocationPlan> = Vec::new();
 
         let reader = FsBlockReader { fs: self };
@@ -4898,20 +4926,18 @@ impl Filesystem {
                 self.dev.read_at(block * bs_u64, &mut buf)?;
                 Ok(buf)
             };
-            let meta_plan = crate::alloc::plan_block_allocation(
+            let meta_plan = crate::alloc::plan_block_allocation_excluding(
                 &self.sb,
                 &self.allocation_groups(),
                 1,
                 parent_group,
+                &reserved,
                 &mut bm_reader,
             )?;
-            if meta_plan.first_block == data_block {
-                // The allocator returned the same block we reserved for the
-                // data page.  There are no other free blocks in this group,
-                // so the tree cannot grow further.
-                return Err(Error::NoSpaceLeftOnDevice);
-            }
             meta_block_count += 1;
+            for i in 0..meta_plan.count as u64 {
+                reserved.push(meta_plan.first_block + i);
+            }
             pending_meta.push(meta_plan);
             Ok(pending_meta.last().unwrap().first_block)
         };
