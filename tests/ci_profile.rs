@@ -43,6 +43,7 @@
 //! runs at all; keep the step but drop the variable and the runtime
 //! test runs, finds nothing to check, and passes doing nothing.
 
+use saphyr::{LoadableYamlNode, Yaml};
 use std::path::{Path, PathBuf};
 
 fn manifest_dir() -> PathBuf {
@@ -78,8 +79,8 @@ fn read_or_panic(path: &Path) -> String {
 ///
 /// And the run must carry `EXPECT_OVERFLOW_CHECKS=1` -- a debug step
 /// that never asks the build anything buys nothing over deleting it.
-fn checking_debug_runs(workflow: &str) -> Vec<String> {
-    workflow
+fn checking_debug_runs(script: &str) -> Vec<String> {
+    script
         .lines()
         .filter_map(|raw| {
             let line = raw.trim_start();
@@ -134,8 +135,40 @@ fn checking_debug_runs(workflow: &str) -> Vec<String> {
 /// the handshake this guard looks for is itself an environment
 /// variable and a maintainer may reasonably move it into a mapping.
 ///
-/// A `run:` whose value is a `|` block is joined into one string, so a
-/// command inside a shell loop is seen whole rather than as fragments.
+/// # WHY THIS IS PARSED AND NO LONGER SCANNED
+///
+/// The version this replaces hand-rolled the YAML, and it was correct
+/// only in the sense that it had been patched five times. Each patch
+/// was a helper taught one more piece of ordinary grammar:
+///
+/// ```text
+///   without_comment        a trailing `#`, so a commented-out trigger
+///                          stopped counting as a trigger
+///   key_of                 quotes, so `"if": false` stopped being a
+///                          different key from `if: false`
+///   opens_a_block_scalar   `|-`, `|+`, `>`, `>-`, `>+`, `|2`, `>2-`,
+///                          so a block's contents were read at all
+///   indent_of              the block structure itself
+///   triggers: Vec<String>  whole names, so `pull_request_review` and
+///                          `pull_request` stopped being the same
+/// ```
+///
+/// Every one of those is a rule a YAML parser already has. And the
+/// cost of learning them by hand is recorded in this file, twice over:
+/// `key_of`'s own comment noted that the identical quote-normalisation
+/// had already been added to `profiles_disabling_overflow_checks` a
+/// few dozen lines above, after a quoted `"overflow-checks" = false`
+/// defeated that scan -- the lesson did not travel between two parsers
+/// in one file. Learning it a sixth time was the alternative to this.
+///
+/// The properties those helpers defended are not dropped with them.
+/// Each is now asserted in `mod gating` against the parser instead:
+/// every block scalar style is read whole, a quoted key is the same
+/// key, a commented-out trigger is not a trigger, and a `#` inside a
+/// quoted shell value is content rather than a comment.
+///
+/// `saphyr` is a dev-dependency, so nothing here reaches a consumer of
+/// the crate.
 #[derive(Debug)]
 struct Step {
     keys: Vec<String>,
@@ -159,251 +192,104 @@ struct Workflow {
     jobs: Vec<Job>,
 }
 
-fn indent_of(line: &str) -> usize {
-    line.len() - line.trim_start().len()
+/// The value of `name` in a YAML mapping, or `None`.
+///
+/// By name rather than by constructing a key, because `saphyr`'s `Yaml`
+/// borrows the source text and building one to hand to `get` is more
+/// ceremony than the lookup is worth here.
+fn field<'a, 'b>(node: &'a Yaml<'b>, name: &str) -> Option<&'a Yaml<'b>> {
+    node.as_mapping()?
+        .iter()
+        .find(|(key, _)| key.as_str() == Some(name))
+        .map(|(_, value)| value)
 }
 
-/// A line with any trailing comment removed.
+/// The keys of a YAML mapping, as plain strings.
 ///
-/// Only a `#` that starts a token counts, so a `#` inside a value --
-/// `run: echo '#1'` -- is left alone. Crude next to real YAML, and in
-/// the safe direction: a comment mistaken for content can only make
-/// this parser see a key that is not there, which refuses a workflow
-/// rather than approving one.
-fn without_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'#' && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
-            return &line[..i];
-        }
-    }
-    line
-}
-
-/// The key a mapping line declares, with any quotes removed.
-///
-/// `"if": false` and `'continue-on-error': true` are valid YAML and
-/// GitHub Actions honours them exactly as the bare spellings, but a
-/// raw text compare against `if` matches neither -- so a step that
-/// does not gate was counted as one that does. The quotes are the
-/// whole finding; everything else here is unchanged.
-fn key_of(line: &str) -> Option<String> {
-    let t = without_comment(line).trim();
-    let t = t.strip_prefix("- ").unwrap_or(t);
-    let t = t.trim_start();
-    let (raw, _) = t.split_once(':')?;
-    // The SAME normalisation `profiles_disabling_overflow_checks`
-    // already applies to manifest keys in this file, after a quoted
-    // `"overflow-checks" = false` defeated that scan. The lesson did
-    // not travel the few dozen lines from the TOML parser to the YAML
-    // one; it has now.
-    let unquoted = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-    if unquoted.is_empty() {
-        return None;
-    }
-    Some(unquoted.to_string())
-}
-
-/// Whether a `run:`'s value opens a block scalar rather than being the
-/// command itself.
-///
-/// `|` is not the only spelling. YAML's chomping and indentation
-/// indicators -- `|-`, `|+`, `>`, `>-`, `>+`, `|2`, `>2-` -- all open
-/// a block, and treating one as the command meant the block's contents
-/// were never read: a behaviour-preserving change from `|` to `|-`
-/// made the guard report that nothing gated.
-fn opens_a_block_scalar(value: &str) -> bool {
-    let v = value.trim();
-    let Some(rest) = v.strip_prefix('|').or_else(|| v.strip_prefix('>')) else {
-        return false;
-    };
-    rest.chars()
-        .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
+/// The parser has already resolved the quoting, so `"if"`, `'if'` and
+/// `if` all arrive here as `if`. That is the whole of what `key_of`
+/// did: there is no un-quoting step left to forget.
+fn keys_of(node: &Yaml) -> Vec<String> {
+    node.as_mapping()
+        .map(|mapping| {
+            mapping
+                .iter()
+                .filter_map(|(key, _)| key.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Structure a workflow far enough to answer the questions above.
 ///
-/// Deliberately conservative: anything this cannot place confidently
-/// is left out, so an unparsed step is a step that does not count. The
-/// failure direction is a guard that refuses a workflow it did not
-/// understand, which is loud, rather than one that approves it.
+/// Panics on a workflow it cannot parse, deliberately. A guard that
+/// returned an empty `Workflow` for a file it did not understand would
+/// report "no debug run gates this" -- a failure, so that direction is
+/// safe -- but one that returned early with a PASS would be the
+/// blindness this module exists to prevent. Failing on the parse error
+/// names the real problem instead of a consequence of it.
 fn parse_workflow(text: &str) -> Workflow {
-    let mut triggers: Vec<String> = Vec::new();
-    let mut jobs: Vec<Job> = Vec::new();
-
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0usize;
-    // The `on:` block, parsed into trigger NAMES up to the next
-    // top-level key. Comments are stripped and each name is matched
-    // whole, so `pull_request_review:` and a commented-out
-    // `# pull_request` are not `pull_request`.
-    while i < lines.len() {
-        let l = lines[i];
-        if key_of(l).as_deref() == Some("on") && indent_of(l) == 0 {
-            // `on: push` and `on: [push, pull_request]` both put the
-            // triggers on this line.
-            if let Some((_, after)) = without_comment(l).split_once(':') {
-                let after = after.trim();
-                let inner = after
-                    .strip_prefix('[')
-                    .and_then(|a| a.strip_suffix(']'))
-                    .unwrap_or(after);
-                for name in inner.split(',') {
-                    let name = name.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-                    if !name.is_empty() {
-                        triggers.push(name.to_string());
-                    }
-                }
-            }
-            i += 1;
-            while i < lines.len() && (lines[i].trim().is_empty() || indent_of(lines[i]) > 0) {
-                let line = without_comment(lines[i]);
-                // A trigger is a key -- or a `- name` item -- at the
-                // block's own indent. Anything deeper belongs to a
-                // trigger's own options (`branches:`, `types:`) and is
-                // not itself a trigger.
-                if indent_of(line) == 2 {
-                    if let Some(k) = key_of(line) {
-                        triggers.push(k);
-                    } else if let Some(item) = line.trim().strip_prefix("- ") {
-                        let item = item.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-                        if !item.is_empty() {
-                            triggers.push(item.to_string());
-                        }
-                    }
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if indent_of(l) == 0 && key_of(l).as_deref() == Some("jobs") {
-            i += 1;
-            break;
-        }
-        i += 1;
-    }
-
-    // Jobs: each is a key at indent 2 under `jobs:`.
-    while i < lines.len() {
-        let line = lines[i];
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
-            i += 1;
-            continue;
-        }
-        let ind = indent_of(line);
-        if ind == 0 {
-            break; // another top-level key; jobs are done
-        }
-        if ind != 2 || !without_comment(line).trim_end().ends_with(':') {
-            i += 1;
-            continue;
-        }
-        // A job. Collect its keys and steps until the next indent-2 key.
-        let mut job = Job {
-            keys: Vec::new(),
-            steps: Vec::new(),
+    let documents = Yaml::load_from_str(text).unwrap_or_else(|e| {
+        panic!(
+            "workflow is not valid YAML: {e}. This guard reads the workflow \
+             rather than scanning its text, so a file it cannot parse is a \
+             failure and never a pass."
+        )
+    });
+    let Some(document) = documents.first() else {
+        return Workflow {
+            triggers: Vec::new(),
+            jobs: Vec::new(),
         };
-        i += 1;
-        while i < lines.len() {
-            let l = lines[i];
-            if !l.trim().is_empty() && indent_of(l) <= 2 && !l.trim_start().starts_with('#') {
-                break;
-            }
-            let t = without_comment(l).trim_start();
-            if indent_of(l) == 4 && !t.starts_with('#') && !t.starts_with('-') {
-                if let Some(key) = key_of(l) {
-                    job.keys.push(key);
-                }
-            }
-            if indent_of(l) == 4 && key_of(l).as_deref() == Some("steps") {
-                i += 1;
-                // Steps: list items at some indent > 4.
-                let mut item_indent: Option<usize> = None;
-                while i < lines.len() {
-                    let sl = lines[i];
-                    if !sl.trim().is_empty()
-                        && indent_of(sl) <= 4
-                        && !sl.trim_start().starts_with('#')
-                    {
-                        break;
-                    }
-                    let st = sl.trim_start();
-                    if st.starts_with("- ") {
-                        let this_indent = indent_of(sl);
-                        if item_indent.is_none() {
-                            item_indent = Some(this_indent);
-                        }
-                        if Some(this_indent) == item_indent {
-                            // A new step. Its keys sit at this_indent + 2.
-                            let key_indent = this_indent + 2;
-                            let mut step = Step {
-                                keys: Vec::new(),
-                                run: String::new(),
-                            };
-                            // First key is on the `- ` line itself.
-                            let mut cur = st.trim_start_matches("- ").to_string();
-                            let mut in_run = false;
-                            loop {
-                                let key = key_of(&cur).unwrap_or_default();
-                                if !key.is_empty() {
-                                    step.keys.push(key.clone());
-                                }
-                                if key == "run" {
-                                    in_run = true;
-                                    let after = without_comment(&cur)
-                                        .split_once(':')
-                                        .map(|x| x.1)
-                                        .unwrap_or("")
-                                        .trim();
-                                    // A block scalar in ANY of its
-                                    // spellings means the command is
-                                    // on the following lines.
-                                    if !opens_a_block_scalar(after) && !after.is_empty() {
-                                        step.run.push_str(after);
-                                        step.run.push('\n');
-                                        in_run = false;
-                                    }
-                                } else if in_run {
-                                    in_run = false;
-                                }
-                                i += 1;
-                                if i >= lines.len() {
-                                    break;
-                                }
-                                let nl = lines[i];
-                                if nl.trim().is_empty() {
-                                    continue;
-                                }
-                                let ni = indent_of(nl);
-                                let nt = nl.trim_start();
-                                if ni <= this_indent && !nt.starts_with('#') {
-                                    break; // next step or end of steps
-                                }
-                                if in_run && ni > key_indent {
-                                    step.run.push_str(nt);
-                                    step.run.push('\n');
-                                    continue;
-                                }
-                                if ni == key_indent && !nt.starts_with('#') {
-                                    cur = nt.to_string();
-                                    continue;
-                                }
-                                // Anything else (comments, a deeper mapping
-                                // under a non-run key such as `env:` or
-                                // `with:`) is skipped, which is what makes
-                                // those keys accepted rather than fatal.
-                            }
-                            job.steps.push(step);
-                            continue;
-                        }
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            i += 1;
+    };
+
+    // `on:` takes three legal shapes: a mapping of trigger names, a
+    // sequence of them, or a single scalar. All three are names.
+    //
+    // Note that `on` survives as the string key `on` and is not folded
+    // into the boolean `true` -- saphyr implements the YAML 1.2 core
+    // schema, where only `true`/`false` are booleans. The YAML 1.1
+    // reading that would break every GitHub workflow ever written does
+    // not apply.
+    let triggers = match field(document, "on") {
+        Some(on) if on.as_mapping().is_some() => keys_of(on),
+        Some(on) if on.as_sequence().is_some() => on
+            .as_sequence()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        Some(on) => on.as_str().map(str::to_string).into_iter().collect(),
+        None => Vec::new(),
+    };
+
+    let mut jobs = Vec::new();
+    if let Some(mapping) = field(document, "jobs").and_then(Yaml::as_mapping) {
+        for (_, body) in mapping.iter() {
+            let steps = field(body, "steps")
+                .and_then(Yaml::as_sequence)
+                .into_iter()
+                .flatten()
+                .map(|step| Step {
+                    keys: keys_of(step),
+                    // A `run:` block of any style -- `|`, `|-`, `|+`,
+                    // `>`, `>-`, `>+`, `|2`, `>2-` -- arrives as one
+                    // string with the block folded per its own rules,
+                    // so a command inside a shell loop is seen whole
+                    // rather than as fragments, and no style is
+                    // mistaken for the command itself. That is what
+                    // `opens_a_block_scalar` enumerated by hand.
+                    run: field(step, "run")
+                        .and_then(Yaml::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+                .collect();
+            jobs.push(Job {
+                keys: keys_of(body),
+                steps,
+            });
         }
-        jobs.push(job);
     }
 
     Workflow { triggers, jobs }
@@ -414,36 +300,81 @@ fn parse_workflow(text: &str) -> Workflow {
 /// The assumption the `ci.yml`-only scope rests on, and a fact about
 /// the file rather than a given: if the triggers stop including
 /// `pull_request`, the step gates nothing however it looks.
+///
+/// MATCHED WHOLE, against parsed trigger names. A substring search
+/// over the `on:` block's text answered `true` for
+/// `pull_request_review:` -- which fires on review events, not on a
+/// pull request opening or being pushed to, so it gates nothing -- and
+/// for `pull_request` inside a comment, including the comment that
+/// says it was switched off.
+///
+/// # `pull_request_target` is NOT accepted, and that is a change
+///
+/// This guard used to accept it, on the reasoning that it also runs on
+/// pull requests and can be a required check. That was rust-fs-ext4#149. It runs
+/// against the BASE repository with a write token and the repository's
+/// secrets, and checks out the base ref by default, so a workflow
+/// triggered only that way may never build the contributor's code at
+/// all -- and accepting it as proof the merge is gated is permissive
+/// in the worst direction for twelve library crates that take pull
+/// requests from forks.
+///
+/// The alternative considered was to accept it conditionally, on
+/// finding a checkout that names the pull request head. Both designs
+/// refuse when they do not recognise the checkout, so both fail safe;
+/// what settled it is that `pull_request_target` appears in ZERO of
+/// the twelve repositories' workflows. The conditional branch would
+/// guard a configuration that exists nowhere, and "we do not use this
+/// trigger, and a test says so" is the better standing statement.
+///
+/// Note the narrowness of what this refuses: a workflow carrying BOTH
+/// `pull_request:` and `pull_request_target:` -- the ordinary way to
+/// reach secrets without giving up the gate -- is satisfied by the
+/// former and never reaches this question.
 fn runs_on_pull_request(wf: &Workflow) -> bool {
-    // MATCHED WHOLE, against parsed trigger names. A substring search
-    // over the `on:` block's text answered `true` for
-    // `pull_request_review:` -- which fires on review events, not on a
-    // pull request opening or being pushed to, so it gates nothing --
-    // and for `pull_request` inside a comment, including the comment
-    // that says it was switched off.
-    //
-    // `pull_request_target` IS included, deliberately: it runs on pull
-    // requests, in the base-repository context, and can be a required
-    // check. It is named rather than matched by prefix.
-    wf.triggers
-        .iter()
-        .any(|t| t == "pull_request" || t == "pull_request_target")
+    wf.triggers.iter().any(|t| t == "pull_request")
 }
 
 /// Keys whose presence on a step or job means its result does not gate.
 const NON_GATING_KEYS: [&str; 2] = ["if", "continue-on-error"];
 
-fn job_gates(job: &Job) -> bool {
-    !job.keys
-        .iter()
-        .any(|k| NON_GATING_KEYS.contains(&k.as_str()))
-}
+/// Walk a workflow's steps and collect what `select` finds in each
+/// `run:`.
+///
+/// `gating` restricts the walk to steps whose result the pull-request
+/// gate actually reads: the workflow must still trigger on a pull
+/// request, and neither the job nor the step may carry a key from
+/// [`NON_GATING_KEYS`].
+///
+/// One walk, shared by both halves of the guard. BOTH HALVES ARE
+/// STEP-AWARE, and that is deliberate. On the sibling `rust-fs-btrfs`
+/// copy of this guard the headline assertion was left line-based while
+/// only the handshake one was step-aware, so under `if: false` the
+/// headline PASSED and its own failure message would have claimed the
+/// pull-request gate could see an overflow when the step it names does
+/// not run. Sharing the walk is what stops the two drifting apart
+/// again, rather than fixing them separately twice.
+fn scan_steps(workflow: &str, gating: bool, select: fn(&str) -> Vec<String>) -> Vec<String> {
+    let wf = parse_workflow(workflow);
+    if gating && !runs_on_pull_request(&wf) {
+        return Vec::new();
+    }
+    let carries_a_non_gating_key =
+        |keys: &[String]| keys.iter().any(|k| NON_GATING_KEYS.contains(&k.as_str()));
 
-fn step_gates(step: &Step) -> bool {
-    !step
-        .keys
-        .iter()
-        .any(|k| NON_GATING_KEYS.contains(&k.as_str()))
+    let mut out = Vec::new();
+    for job in &wf.jobs {
+        if gating && carries_a_non_gating_key(&job.keys) {
+            continue;
+        }
+        for step in &job.steps {
+            if gating && carries_a_non_gating_key(&step.keys) {
+                continue;
+            }
+            out.extend(select(&step.run));
+        }
+    }
+    out
 }
 
 /// The checking debug runs of steps that ACTUALLY GATE a pull request.
@@ -454,17 +385,7 @@ fn step_gates(step: &Step) -> bool {
 /// guarded step in `ci.yml`, or `continue-on-error: true`, left all
 /// the guard's tests green while the gate stopped gating. See #142.
 fn gating_checking_debug_runs(workflow: &str) -> Vec<String> {
-    let wf = parse_workflow(workflow);
-    if !runs_on_pull_request(&wf) {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for job in wf.jobs.iter().filter(|j| job_gates(j)) {
-        for step in job.steps.iter().filter(|s| step_gates(s)) {
-            out.extend(checking_debug_runs(&step.run));
-        }
-    }
-    out
+    scan_steps(workflow, true, checking_debug_runs)
 }
 
 /// The guard. Reads `ci.yml` -- the workflow that gates a pull request
@@ -643,14 +564,77 @@ jobs:
     /// a required check. The defeat that matters is the trigger going
     /// away, which the test above covers by removing it.
     #[test]
-    fn a_pull_request_target_trigger_still_gates() {
+    fn a_pull_request_target_trigger_alone_does_not_gate() {
         let yaml = GATING.replace("  pull_request:\n", "  pull_request_target:\n");
+        assert_ne!(yaml, GATING, "the mutation must actually apply");
+        assert!(
+            gating(&yaml).is_empty(),
+            "pull_request_target runs against the BASE repository with a write token and \
+             the repository's secrets, and checks out the base ref by default, so a \
+             workflow triggered only that way may never build the contributor's code. \
+             It is not proof that the merge is gated. See rust-fs-ext4#149."
+        );
+    }
+
+    /// THE CONTROL THAT STOPS THE REFUSAL OVER-CORRECTING.
+    ///
+    /// Carrying both triggers is the ordinary way to reach secrets
+    /// without giving up the gate, and such a workflow IS gated -- by
+    /// its `pull_request:` key, which the refusal above must not
+    /// disturb. Without this test, narrowing the comparison to
+    /// `t == "pull_request" && !any(t == "pull_request_target")` would
+    /// pass every other assertion in this file while refusing a
+    /// perfectly gated workflow. Contributed by the branch this change
+    /// supersedes; it is the arm that branch added and the reason to
+    /// keep it whatever the parser looks like.
+    #[test]
+    fn a_workflow_carrying_both_triggers_still_gates() {
+        let yaml = GATING.replace(
+            "  pull_request:\n",
+            "  pull_request:\n  pull_request_target:\n",
+        );
         assert_ne!(yaml, GATING, "the mutation must actually apply");
         assert_eq!(
             gating(&yaml).len(),
             1,
-            "pull_request_target runs on a pull request too, so a step under it gates"
+            "the workflow still triggers on pull_request, so it still gates; refusing it \
+             would be the over-correction"
         );
+    }
+
+    /// A `#` inside a quoted shell value is content, not a comment.
+    ///
+    /// This is what `without_comment` defended, and it is the reason
+    /// that helper existed: a hand-rolled scanner has to decide where
+    /// a comment starts, and its own doc conceded the rule was "crude
+    /// next to real YAML". The parser decides it by the grammar --
+    /// inside a quoted scalar a `#` is simply a character -- so the
+    /// property is asserted here rather than left to a heuristic.
+    #[test]
+    fn a_hash_inside_a_quoted_value_is_content_not_a_comment() {
+        let yaml = GATING.replace(
+            "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
+            "      - run: echo '#1'; EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
+        );
+        assert_ne!(yaml, GATING, "the mutation must actually apply");
+        assert_eq!(
+            gating(&yaml).len(),
+            1,
+            "the `#` is inside a quoted shell string, so the command after it is still \
+             the command; treating it as a comment would refuse a correct workflow"
+        );
+    }
+
+    /// A workflow the parser cannot read is a failure, never a pass.
+    ///
+    /// The direction matters: swallowing the error and returning an
+    /// empty structure would report "no debug run gates this", which is
+    /// also a failure and therefore safe -- but returning early with a
+    /// pass would be the blindness this module exists to refuse.
+    #[test]
+    #[should_panic(expected = "not valid YAML")]
+    fn a_workflow_that_does_not_parse_is_a_failure() {
+        super::parse_workflow("jobs:\n  test:\n   - broken: [unclosed\n");
     }
 
     /// THE OTHER DIRECTION, which is the one that costs something.
@@ -792,7 +776,7 @@ jobs:
     /// preserves behaviour, made the guard report that nothing gated.
     #[test]
     fn a_run_block_is_read_whole_in_every_block_scalar_spelling() {
-        for indicator in ["|", "|-", "|+", ">", ">-", ">+", "|2"] {
+        for indicator in ["|", "|-", "|+", ">", ">-", ">+", "|2", ">2-"] {
             let yaml = format!(
                 "on:\n  pull_request:\n    branches: [main]\njobs:\n  test:\n    steps:\n\
                  {}      - name: a block\n        run: {indicator}\n          set -euo pipefail\n\

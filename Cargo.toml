@@ -39,6 +39,17 @@ am-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
 
 [dev-dependencies]
 hex = "0.4"
+# YAML parser for tests/ci_profile.rs, which reads .github/workflows/ci.yml
+# and refuses if the debug run that lets the PR gate see an arithmetic
+# overflow has been removed or disabled. That guard hand-rolled its own
+# scanner and needed a helper per piece of ordinary grammar -- comments,
+# quoted keys, block scalar styles, indentation, whole trigger names --
+# all of which a YAML parser already has. Pure Rust, YAML 1.2 (so
+# GitHub's `on:` key stays the string `on` and is not folded into a
+# boolean), MIT/Apache-2.0, and no C to transpile -- unlike serde_yaml,
+# which is deprecated and wraps unsafe-libyaml. Test-only: it never
+# reaches a consumer of this crate.
+saphyr = "0.0.12"
 
 [profile.release]
 lto = true
