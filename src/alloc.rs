@@ -215,7 +215,8 @@ pub fn find_free_run(bitmap: &[u8], start: u32, max_bits: u32, count: u32) -> Op
 /// `bitmap_reader` is called with a BGD's `bg_block_bitmap` and must return
 /// the full bitmap block (block_size bytes). Groups are tried in order:
 /// hint_group first, then wrapping forward. For groups flagged
-/// `BLOCK_UNINIT`, the bitmap is treated as all-free without reading.
+/// `BLOCK_UNINIT`, the bitmap is reconstructed from the filesystem's metadata
+/// layout without reading unspecified on-disk bitmap bytes.
 pub fn plan_block_allocation<F>(
     sb: &Superblock,
     groups: &[BlockGroupDescriptor],
@@ -247,7 +248,7 @@ where
         let max_bits = blocks_in_group(sb, gi);
 
         let bitmap_bytes: Vec<u8> = if bgd.flags().contains(BgdFlags::BLOCK_UNINIT) {
-            vec![0u8; sb.block_size() as usize]
+            initial_block_bitmap(sb, groups, gi)?
         } else {
             bitmap_reader(bgd.block_bitmap)?
         };
@@ -287,25 +288,61 @@ where
     ))
 }
 
-/// Returns the number of blocks that actually exist in group `gi` (the last
-/// group may be shorter than `blocks_per_group`).
+/// Materialize an uninitialized block bitmap for both planning and commit.
+/// `BLOCK_UNINIT` leaves bitmap bytes unspecified; it does not make filesystem
+/// metadata available for file data. Reserving it only at commit is too late:
+/// the planned extent may already name a backup superblock or resize inode.
+pub(crate) fn initial_block_bitmap(
+    sb: &Superblock,
+    groups: &[BlockGroupDescriptor],
+    gi: u32,
+) -> Result<Vec<u8>> {
+    let bs = u64::from(sb.block_size());
+    if u64::from(sb.blocks_per_group) > bs * 8 {
+        return Err(Error::Corrupt("block group exceeds bitmap capacity"));
+    }
+    let group_start =
+        u64::from(sb.first_data_block) + u64::from(gi) * u64::from(sb.blocks_per_group);
+    let valid_blocks = blocks_in_group(sb, gi);
+    let group_end = group_start + u64::from(valid_blocks);
+    let mut bitmap = vec![0u8; bs as usize];
+    let mut reserve = |start: u64, count: u64| {
+        // Flex groups can place another group's metadata here, including an
+        // inode table which starts before this group and ends inside it.
+        let first = start.max(group_start);
+        let end = start.saturating_add(count).min(group_end);
+        for block in first..end {
+            let bit = block - group_start;
+            bitmap[(bit / 8) as usize] |= 1 << (bit % 8);
+        }
+    };
+    if sb.group_has_super(u64::from(gi)) {
+        let gdt_blocks = (groups.len() as u64 * u64::from(sb.desc_size)).div_ceil(bs);
+        reserve(
+            group_start,
+            1 + gdt_blocks + u64::from(sb.reserved_gdt_blocks),
+        );
+    }
+    let itable_blocks = (u64::from(sb.inodes_per_group) * u64::from(sb.inode_size)).div_ceil(bs);
+    for group in groups {
+        reserve(group.block_bitmap, 1);
+        reserve(group.inode_bitmap, 1);
+        reserve(group.inode_table, itable_blocks);
+    }
+    // The final group can be short, and blocks_per_group can be smaller than
+    // a bitmap's capacity. Linux requires both kinds of padding to be marked.
+    for bit in valid_blocks..(bitmap.len() as u32 * 8) {
+        bitmap[(bit / 8) as usize] |= 1 << (bit % 8);
+    }
+    Ok(bitmap)
+}
+
+/// Returns only the blocks physically present after this group's start.
 fn blocks_in_group(sb: &Superblock, gi: u32) -> u32 {
-    let ngroups = sb.block_group_count() as u32;
-    if gi + 1 < ngroups {
-        return sb.blocks_per_group;
-    }
-    // Saturating: `s_first_data_block` is not among the fields
-    // `Superblock::parse` bounds, and a value above `blocks_count`
-    // wrapped this subtraction -- which made the last group's bit
-    // ceiling far larger than the group, so the allocator handed out
-    // blocks outside the filesystem.
-    let remainder =
-        sb.blocks_count.saturating_sub(sb.first_data_block as u64) % sb.blocks_per_group as u64;
-    if remainder == 0 {
-        sb.blocks_per_group
-    } else {
-        remainder as u32
-    }
+    let start = u64::from(sb.first_data_block) + u64::from(gi) * u64::from(sb.blocks_per_group);
+    sb.blocks_count
+        .saturating_sub(start)
+        .min(u64::from(sb.blocks_per_group)) as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -692,7 +729,7 @@ mod tests {
     #[test]
     fn block_allocation_honours_block_uninit_flag() {
         let sb = mk_sb(4096, 32768, 8192, 65536);
-        // group 0 is UNINIT → treated as all-free without reading bitmap
+        // UNINIT bytes are not read, but fixed metadata is still reserved.
         let g0 = mk_bgd(32768, 8000, 0, BgdFlags::BLOCK_UNINIT.bits());
         let groups = vec![g0];
         let mut call_count = 0;
@@ -703,6 +740,58 @@ mod tests {
         let plan = plan_block_allocation(&sb, &groups, 4, 0, read).unwrap();
         assert_eq!(plan.count, 4);
         assert_eq!(call_count, 0, "UNINIT group should not read bitmap");
+    }
+
+    #[test]
+    fn uninitialized_groups_reserve_each_superblock_layout_and_gdt_growth() {
+        let mut sb = mk_sb(1024, 8192, 128, 7 * 8192 + 1);
+        sb.reserved_gdt_blocks = 16;
+        let groups = vec![mk_bgd(8000, 128, 0, BgdFlags::BLOCK_UNINIT.bits()); 7];
+        let first_free = |sb: &Superblock, gi| {
+            plan_block_allocation(sb, &groups, 1, gi, |_| panic!("uninit bitmap read"))
+                .unwrap()
+                .bitmap
+                .bit_start
+        };
+        sb.feature_ro_compat = crate::features::RoCompat::SPARSE_SUPER.bits();
+        assert_eq!(first_free(&sb, 3), 18, "superblock + GDT + reserved GDT");
+        assert_eq!(first_free(&sb, 2), 0, "classic non-backup group");
+        sb.feature_compat = crate::features::Compat::SPARSE_SUPER2.bits();
+        sb.backup_bgs = [2, 4];
+        assert_eq!(first_free(&sb, 2), 18);
+        assert_eq!(first_free(&sb, 3), 0, "only named groups carry backups");
+        sb.feature_compat = 0;
+        sb.feature_ro_compat = 0;
+        assert_eq!(first_free(&sb, 2), 18, "non-sparse backups in every group");
+    }
+
+    #[test]
+    fn uninitialized_bitmap_reserves_other_groups_straddling_metadata_and_tail() {
+        let sb = mk_sb(1024, 128, 32, 144);
+        let mut other = mk_bgd(0, 0, 0, 0);
+        other.inode_table = 126; // Eight blocks: ends inside group 1 at 134.
+        other.block_bitmap = 134;
+        other.inode_bitmap = 135;
+        let mut group = mk_bgd(8, 32, 0, BgdFlags::BLOCK_UNINIT.bits());
+        group.block_bitmap = 64;
+        group.inode_bitmap = 65;
+        group.inode_table = 66; // This group's own metadata lives elsewhere.
+        let groups = [other, group];
+        let bitmap = initial_block_bitmap(&sb, &groups, 1).unwrap();
+        assert!((0..7).all(|bit| bit_is_set(&bitmap, bit)));
+        assert!((7..15).all(|bit| !bit_is_set(&bitmap, bit)));
+        assert!((15..8192).all(|bit| bit_is_set(&bitmap, bit)));
+        let plan = plan_block_allocation(&sb, &groups, 8, 1, |_| unreachable!()).unwrap();
+        assert_eq!(plan.first_block, 136);
+        assert!(plan_block_allocation(&sb, &groups, 9, 1, |_| unreachable!()).is_err());
+    }
+
+    #[test]
+    fn uninitialized_group_larger_than_its_bitmap_is_rejected() {
+        let sb = mk_sb(4096, 65536, 32, 65537);
+        let mut group = mk_bgd(65500, 32, 0, BgdFlags::BLOCK_UNINIT.bits());
+        group.block_bitmap = 60000;
+        assert!(plan_block_allocation(&sb, &[group], 1, 0, |_| unreachable!()).is_err());
     }
 
     /// Inode numbers are one-based, and group 0's first *available*
@@ -802,5 +891,11 @@ mod tests {
         let sb = mk_sb(4096, 32768, 8192, 32769 + 100);
         assert_eq!(blocks_in_group(&sb, 0), 32768); // full
         assert_eq!(blocks_in_group(&sb, 1), 100); // short last group
+    }
+
+    #[test]
+    fn block_group_starting_at_end_of_volume_has_no_blocks() {
+        let sb = mk_sb(1024, 8192, 128, 8193);
+        assert_eq!(blocks_in_group(&sb, 1), 0);
     }
 }

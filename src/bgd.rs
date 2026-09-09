@@ -32,7 +32,7 @@ bitflags::bitflags! {
     pub struct BgdFlags: u16 {
         /// Inode table not initialized — skip reading (treat as all-free).
         const INODE_UNINIT = 0x0001;
-        /// Block bitmap not initialized — treat as all blocks free.
+        /// Block bitmap not initialized — reconstruct its reserved metadata.
         const BLOCK_UNINIT = 0x0002;
         /// Inode table is fully zeroed on disk.
         const ITABLE_ZEROED = 0x0004;
@@ -149,7 +149,9 @@ pub fn read_all<D: BlockDevice + ?Sized>(
     for i in 0..(group_count as usize) {
         let off = i * sb.desc_size as usize;
         let raw = &buf[off..off + sb.desc_size as usize];
-        if csum.enabled && !csum.verify_bgd(i as u32, raw, sb.desc_size) {
+        if crate::checksum::group_descriptor_checksum(sb, csum, i as u32, raw).is_some_and(
+            |expected| expected != u16::from_le_bytes(raw[0x1e..0x20].try_into().unwrap()),
+        ) {
             return Err(Error::BadChecksum {
                 what: "block group descriptor",
             });
